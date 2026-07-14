@@ -1,13 +1,13 @@
 {
-  "name": "pi-cua-webcli",
+  "name": "littlecua",
   "version": "1.0.0",
-  "description": "Pi extensions that add native macOS automation (cua_driver) and live Chrome control (web_cli) to the Pi coding agent.",
+  "description": "LittleCua — Pi extensions that add native macOS automation (cua_driver) and live Chrome control (web_cli) to the Pi coding agent.",
   "keywords": ["pi-package"],
   "license": "MIT",
   "author": "MaxAutomize",
   "repository": {
     "type": "git",
-    "url": "https://github.com/MaxAutomize/pi-cua-webcli.git"
+    "url": "https://github.com/MaxAutomize/LittleCua.git"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

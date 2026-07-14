@@ -1,4 +1,4 @@
-# pi-cua-webcli
+# LittleCua
 
 Two [Pi](https://pi.dev) coding-agent extensions, packaged together so a single `pi install` gives your agent both **native macOS automation** and **live Chrome control**:
 
@@ -40,15 +40,15 @@ pi --version
 From anywhere:
 
 ```bash
-pi install git:github.com/MaxAutomize/pi-cua-webcli
+pi install git:github.com/MaxAutomize/LittleCua
 ```
 
-That clones the repo into `~/.pi/agent/git/github.com/MaxAutomize/pi-cua-webcli`, runs `npm install` for any runtime deps, and registers the package in `~/.pi/agent/settings.json`. The two tools (`cua_driver`, `web_cli`) are now available to every Pi session.
+That clones the repo into `~/.pi/agent/git/github.com/MaxAutomize/LittleCua`, runs `npm install` for any runtime deps, and registers the package in `~/.pi/agent/settings.json`. The two tools (`cua_driver`, `web_cli`) are now available to every Pi session.
 
 To try it without permanently installing:
 
 ```bash
-pi -e git:github.com/MaxAutomize/pi-cua-webcli
+pi -e git:github.com/MaxAutomize/LittleCua
 ```
 
 Reload Pi (or run `/reload`) after installing to pick up the new tools.
@@ -114,8 +114,8 @@ You also need a Chrome logged into the account you want the agent to use. `web_c
 ## 4. One-shot setup script
 
 ```bash
-git clone https://github.com/MaxAutomize/pi-cua-webcli.git
-cd pi-cua-webcli
+git clone https://github.com/MaxAutomize/LittleCua.git
+cd LittleCua
 ./install.sh
 ```
 
@@ -146,7 +146,7 @@ Start Pi and just ask — the model picks the right tool:
 ## Repository layout
 
 ```
-pi-cua-webcli/
+LittleCua/
 ├── package.json                 # Pi package manifest (declares extensions)
 ├── install.sh                   # One-command setup helper
 ├── README.md

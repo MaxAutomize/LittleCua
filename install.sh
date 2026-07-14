@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-command installer for pi-cua-webcli.
+# One-command installer for LittleCua.
 # Checks/installs Node, Pi, the native runtimes (CuaDriver + the web Chrome shim),
 # then registers this package with Pi. Safe to re-run.
 #
@@ -65,7 +65,7 @@ if [ ! -d "/Applications/Google Chrome.app" ]; then
 fi
 
 # --- Register this package with Pi ----------------------------------------
-say "Registering pi-cua-webcli with Pi (local checkout)…"
+say "Registering LittleCua with Pi (local checkout)…"
 pi install "$REPO_DIR"
 
 say "Done. Start/reload Pi and ask the agent to use cua_driver or web_cli."
