@@ -1,0 +1,927 @@
+#!/bin/bash
+# web — browser interaction via cua-driver page tools + Chrome tab control via AppleScript.
+# Use for live Chrome pages. Avoid AX tree for web content.
+#
+# QUICK START:
+#   web session                    # show the persistent Pi Automation target
+#   web tabs                       # list every Chrome window/tab with bot markers
+#   web switch 2                   # switch a tab inside Pi Automation
+#   web nav https://example.com    # navigate the persistent bot tab
+#   web summary                    # page overview
+#   web click-text "Add to cart"   # click by visible text
+#
+# JS execution is synchronous from the caller's perspective. For network calls inside JS,
+# use synchronous XMLHttpRequest (open(..., false)); async fetch promises often return empty.
+
+set -euo pipefail
+
+WEB_CACHE="/tmp/web-chrome-target"
+WEB_SESSION_FILE="${WEB_SESSION_FILE:-$HOME/.pi/agent/state/chrome-session.env}"
+WEB_SESSION_NAME="${WEB_SESSION_NAME:-Pi Automation}"
+PID="${WEB_PID:-}"
+WID="${WEB_WID:-}"
+TAB_TARGET="${WEB_TAB:-}"
+SESSION_WINDOW_ID=""
+SESSION_TAB_ID=""
+SESSION_TITLE=""
+SESSION_URL=""
+SESSION_BOUNDS=""
+
+json_quote() {
+    # Pure-bash JSON quoting — avoids ~70ms python3 startup per call
+    local input="$1"
+    input="${input//\\/\\\\}"
+    input="${input//\"/\\\"}"
+    input="${input//$'\n'/\\n}"
+    input="${input//$'\r'/\\r}"
+    input="${input//$'\t'/\\t}"
+    printf '"%s"' "$input"
+}
+
+load_session() {
+    if [[ -f "$WEB_SESSION_FILE" ]]; then
+        # This file is written only by this script and contains numeric Chrome IDs.
+        # shellcheck disable=SC1090
+        source "$WEB_SESSION_FILE" 2>/dev/null || true
+        SESSION_WINDOW_ID="${CHROME_WINDOW_ID:-}"
+        SESSION_TAB_ID="${CHROME_TAB_ID:-}"
+    fi
+}
+
+save_session() {
+    mkdir -p "$(dirname "$WEB_SESSION_FILE")"
+    [[ "$SESSION_WINDOW_ID" =~ ^[0-9]+$ ]] || return 1
+    [[ "$SESSION_TAB_ID" =~ ^[0-9]+$ ]] || return 1
+    {
+        printf 'CHROME_WINDOW_ID=%s\n' "$SESSION_WINDOW_ID"
+        printf 'CHROME_TAB_ID=%s\n' "$SESSION_TAB_ID"
+    } > "$WEB_SESSION_FILE"
+}
+
+parse_session_record() {
+    local record="$1" x1 y1 x2 y2
+    IFS=$'\t' read -r SESSION_WINDOW_ID SESSION_TAB_ID x1 y1 x2 y2 SESSION_TITLE SESSION_URL <<< "$record"
+    SESSION_BOUNDS="$x1,$y1,$((x2-x1)),$((y2-y1))"
+    [[ "$SESSION_WINDOW_ID" =~ ^[0-9]+$ && "$SESSION_TAB_ID" =~ ^[0-9]+$ ]]
+}
+
+resolve_session_record() {
+    local wanted_window="$1" wanted_tab="$2"
+    osascript - "$wanted_window" "$wanted_tab" "$WEB_SESSION_NAME" <<'APPLESCRIPT'
+on run argv
+  set wantedWindow to item 1 of argv
+  set wantedTab to item 2 of argv
+  set sessionName to item 3 of argv
+  set d to ASCII character 9
+  tell application "Google Chrome"
+    set targetWindow to missing value
+    if wantedWindow is not "" then
+      repeat with w in windows
+        if (id of w as text) is wantedWindow then
+          try
+            if (given name of w as text) is sessionName then set targetWindow to w
+          end try
+          if targetWindow is not missing value then exit repeat
+        end if
+      end repeat
+    end if
+    if targetWindow is missing value then
+      repeat with w in windows
+        try
+          if (given name of w as text) is sessionName then
+            set targetWindow to w
+            exit repeat
+          end if
+        end try
+      end repeat
+    end if
+    if targetWindow is missing value then error "Pi Automation Chrome window is missing"
+
+    set targetTab to missing value
+    if wantedTab is not "" then
+      repeat with t in tabs of targetWindow
+        if (id of t as text) is wantedTab then
+          set targetTab to t
+          exit repeat
+        end if
+      end repeat
+    end if
+    if targetTab is missing value then set targetTab to active tab of targetWindow
+    set b to bounds of targetWindow
+    return (id of targetWindow as text) & d & (id of targetTab as text) & d & (item 1 of b as text) & d & (item 2 of b as text) & d & (item 3 of b as text) & d & (item 4 of b as text) & d & (title of targetTab as text) & d & (URL of targetTab as text)
+  end tell
+end run
+APPLESCRIPT
+}
+
+create_session_record() {
+    osascript - "$WEB_SESSION_NAME" <<'APPLESCRIPT'
+on run argv
+  set sessionName to item 1 of argv
+  set d to ASCII character 9
+  tell application "Google Chrome"
+    set targetWindow to make new window
+    set given name of targetWindow to sessionName
+    set targetTab to active tab of targetWindow
+    set b to bounds of targetWindow
+    return (id of targetWindow as text) & d & (id of targetTab as text) & d & (item 1 of b as text) & d & (item 2 of b as text) & d & (item 3 of b as text) & d & (item 4 of b as text) & d & (title of targetTab as text) & d & (URL of targetTab as text)
+  end tell
+end run
+APPLESCRIPT
+}
+
+ensure_session() {
+    local record
+    load_session
+    if record=$(resolve_session_record "$SESSION_WINDOW_ID" "$SESSION_TAB_ID" 2>/dev/null) && parse_session_record "$record"; then
+        save_session
+        return 0
+    fi
+
+    # Never fall back to the user's front Chrome window. If the persistent bot
+    # window was closed, create a clearly named window in the same Chrome profile,
+    # then restore the user's exact foreground app/window/tab.
+    capture_ui_context
+    record=$(create_session_record 2>/dev/null) || {
+        open -g -b com.google.Chrome --args --new-window >/dev/null 2>&1 || true
+        sleep 0.3
+        record=$(create_session_record)
+    }
+    parse_session_record "$record"
+    save_session
+    restore_ui_context
+}
+
+cmd_session() {
+    ensure_session
+    printf '{"name":%s,"windowId":%s,"tabId":%s,"target":"tab:%s","bounds":%s,"title":%s,"url":%s}\n' \
+        "$(json_quote "$WEB_SESSION_NAME")" "$SESSION_WINDOW_ID" "$SESSION_TAB_ID" "$SESSION_TAB_ID" \
+        "$(json_quote "$SESSION_BOUNDS")" "$(json_quote "$SESSION_TITLE")" "$(json_quote "$SESSION_URL")"
+}
+
+UI_FRONT_APP=""
+UI_CHROME_WINDOW_ID=""
+UI_CHROME_TAB_ID=""
+
+capture_ui_context() {
+    local record
+    record=$(osascript <<'APPLESCRIPT'
+set d to ASCII character 9
+set frontApp to ""
+tell application "System Events"
+  try
+    set frontApp to name of first application process whose frontmost is true
+  end try
+end tell
+set chromeWindow to ""
+set chromeTab to ""
+tell application "Google Chrome"
+  if (count of windows) > 0 then
+    set chromeWindow to id of window 1 as text
+    set chromeTab to id of active tab of window 1 as text
+  end if
+end tell
+return frontApp & d & chromeWindow & d & chromeTab
+APPLESCRIPT
+) || true
+    IFS=$'\t' read -r UI_FRONT_APP UI_CHROME_WINDOW_ID UI_CHROME_TAB_ID <<< "$record"
+}
+
+restore_ui_context() {
+    osascript - "$UI_FRONT_APP" "$UI_CHROME_WINDOW_ID" "$UI_CHROME_TAB_ID" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  set frontApp to item 1 of argv
+  set wantedWindow to item 2 of argv
+  set wantedTab to item 3 of argv
+  tell application "Google Chrome"
+    repeat with w in windows
+      if (id of w as text) is wantedWindow then
+        repeat with t in tabs of w
+          if (id of t as text) is wantedTab then
+            set tabIndex to 0
+            repeat with candidate in tabs of w
+              set tabIndex to tabIndex + 1
+              if (id of candidate as text) is wantedTab then exit repeat
+            end repeat
+            set active tab index of w to tabIndex
+            exit repeat
+          end if
+        end repeat
+        set index of w to 1
+        exit repeat
+      end if
+    end repeat
+  end tell
+  if frontApp is not "" then
+    tell application "System Events"
+      try
+        set frontmost of first application process whose name is frontApp to true
+      end try
+    end tell
+  end if
+end run
+APPLESCRIPT
+}
+
+load_cache() {
+    if [[ -f "$WEB_CACHE" ]]; then
+        # shellcheck disable=SC1090
+        source "$WEB_CACHE" 2>/dev/null || true
+        PID="${PID:-${WEB_PID:-}}"
+        WID="${WID:-${WEB_WID:-}}"
+    fi
+}
+
+write_cache_line() {
+    local pid="$1" wid="$2"
+    printf 'WEB_PID=%s; export WEB_PID; WEB_WID=%s; export WEB_WID\n' "$pid" "$wid"
+}
+
+# Load cached target immediately, but CLI --pid/--wid can override below.
+load_cache
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pid)   PID="${2:?Missing value for --pid}"; shift 2 ;;
+        --wid)   WID="${2:?Missing value for --wid}"; shift 2 ;;
+        --pid=*) PID="${1#--pid=}"; shift ;;
+        --wid=*) WID="${1#--wid=}"; shift ;;
+        --tab)   TAB_TARGET="${2:?Missing value for --tab}"; shift 2 ;;
+        --tab=*) TAB_TARGET="${1#--tab=}"; shift ;;
+        *)       POSITIONAL+=("$1"); shift ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
+cmd_auto() {
+    # Legacy Cua page binding, now made safe: it resolves only the named bot
+    # window instead of caching whichever user Chrome window is visually first.
+    ensure_session
+    local result
+    result=$(cua-driver call list_windows '{"on_screen_only":false}' --compact 2>&1)
+    printf '%s' "$result" | python3 -c '
+import json, sys
+cache, bounds = sys.argv[1], sys.argv[2]
+x, y, width, height = map(int, bounds.split(","))
+try:
+    data = json.load(sys.stdin)
+    wins = [w for w in data.get("windows", []) if w.get("app_name") == "Google Chrome"]
+    named = [w for w in wins if w.get("title") == "Pi Automation"]
+    matched = named or [w for w in wins if w.get("bounds") == {"x":x,"y":y,"width":width,"height":height}]
+    if not matched:
+        raise SystemExit(1)
+    w = matched[0]
+    line = "WEB_PID={}; export WEB_PID; WEB_WID={}; export WEB_WID".format(w["pid"], w["window_id"])
+    print(line)
+    with open(cache, "w") as f:
+        f.write(line + "\n")
+except Exception:
+    raise SystemExit(1)
+' "$WEB_CACHE" "$SESSION_BOUNDS"
+}
+
+ensure_target() {
+    # No --tab means the persistent Pi Automation tab—not whichever Chrome
+    # window happens to be frontmost this turn. "active" remains available as
+    # an explicit opt-in when the user actually wants their current tab used.
+    if [[ -z "$TAB_TARGET" || "$TAB_TARGET" == "session" || "$TAB_TARGET" == "bot" ]]; then
+        ensure_session
+        TAB_TARGET="tab:$SESSION_TAB_ID"
+        return 0
+    fi
+
+    # Explicit tab IDs, active, indices, URLs, and titles are driven directly
+    # through Chrome Apple Events without activating or switching windows.
+    if [[ -n "$TAB_TARGET" ]]; then
+        return 0
+    fi
+
+    # Retained only for explicit legacy WEB_PID/WEB_WID callers.
+    if [[ -n "$PID" && -n "$WID" ]]; then return 0; fi
+    echo "Error: No Chrome target." >&2
+    exit 1
+}
+
+run_js_in_tab() {
+    local target="$1" js="$2"
+    osascript - "$target" "$js" "$WEB_SESSION_NAME" <<'APPLESCRIPT'
+on run argv
+  set needle to item 1 of argv
+  set sourceCode to item 2 of argv
+  set sessionName to item 3 of argv
+  tell application "Google Chrome"
+    set targetTab to missing value
+    set sessionWindow to missing value
+    repeat with w in windows
+      try
+        if (given name of w as text) is sessionName then
+          set sessionWindow to w
+          exit repeat
+        end if
+      end try
+    end repeat
+
+    if needle starts with "tab:" then
+      set wantedId to text 5 thru -1 of needle
+      repeat with w in windows
+        repeat with t in tabs of w
+          if (id of t as text) is wantedId then
+            set targetTab to t
+            exit repeat
+          end if
+        end repeat
+        if targetTab is not missing value then exit repeat
+      end repeat
+    else if needle starts with "window:" then
+      set wantedId to text 8 thru -1 of needle
+      repeat with w in windows
+        if (id of w as text) is wantedId then
+          set targetTab to active tab of w
+          exit repeat
+        end if
+      end repeat
+    else if needle is "session" or needle is "bot" then
+      if sessionWindow is not missing value then set targetTab to active tab of sessionWindow
+    else if needle is "active" or needle is "__active__" then
+      if (count of windows) > 0 then set targetTab to active tab of window 1
+    else
+      try
+        set tabIndex to needle as integer
+        if sessionWindow is not missing value then
+          if tabIndex ≥ 1 and tabIndex ≤ (count of tabs of sessionWindow) then set targetTab to tab tabIndex of sessionWindow
+        else if tabIndex ≥ 1 and tabIndex ≤ (count of tabs of window 1) then
+          set targetTab to tab tabIndex of window 1
+        end if
+      end try
+    end if
+
+    -- Named searches prefer the persistent bot window, then search all Chrome windows.
+    if targetTab is missing value and sessionWindow is not missing value then
+      repeat with t in tabs of sessionWindow
+        if (URL of t contains needle) or (title of t contains needle) then
+          set targetTab to t
+          exit repeat
+        end if
+      end repeat
+    end if
+    if targetTab is missing value then
+      repeat with w in windows
+        repeat with t in tabs of w
+          if (URL of t contains needle) or (title of t contains needle) then
+            set targetTab to t
+            exit repeat
+          end if
+        end repeat
+        if targetTab is not missing value then exit repeat
+      end repeat
+    end if
+    if targetTab is missing value then error "No Chrome tab matches: " & needle
+    return execute targetTab javascript sourceCode
+  end tell
+end run
+APPLESCRIPT
+}
+
+run_js() {
+    local js="$1" quoted_js payload out i
+    if [[ -n "$TAB_TARGET" ]]; then
+        local retries="${WEB_RUN_RETRIES:-3}" rc=0
+        i=0
+        while (( i < retries )); do
+            if out=$(run_js_in_tab "$TAB_TARGET" "$js" 2>&1); then rc=0; else rc=$?; fi
+            if (( rc == 0 )) && ! printf '%s' "$out" | grep -Eq 'missing value|execution error|Can.?t get|Invalid index|No Chrome tab matches'; then
+                printf '%s' "$out"
+                return 0
+            fi
+            (( i++ )) || true
+            sleep 0.15
+        done
+        if printf '%s' "$out" | grep -q 'missing value'; then
+            printf 'web run: JS returned "missing value" after %s attempt(s) — the page may still be navigating or the JS returned undefined.\n' "$retries" >&2
+        else
+            printf '%s\n' "$out" >&2
+        fi
+        return 1
+    fi
+    quoted_js=$(json_quote "$js")
+    payload=$(printf '{"pid":%s,"window_id":%s,"action":"execute_javascript","javascript":%s}\n' "$PID" "$WID" "$quoted_js")
+    # AppleScript `do JavaScript` returns "missing value" when the JS stalls / times
+    # out (common with slow synchronous XMLHttpRequest) or returns undefined. That
+    # is a transient timing failure, not a real error — retry a few times before
+    # giving up so callers don't see silent "missing value" flakiness.
+    local retries="${WEB_RUN_RETRIES:-3}"
+    i=0
+    while (( i < retries )); do
+        out=$(printf '%s' "$payload" | cua-driver call page --compact 2>&1) || true
+        if ! printf '%s' "$out" | grep -q 'missing value'; then
+            printf '%s' "$out"
+            return 0
+        fi
+        (( i++ )) || true
+        sleep 0.4
+    done
+    # All retries returned "missing value" — surface a clear error instead of the
+    # opaque literal so the caller knows to fetch less data or raise the timeout.
+    printf 'web run: JS returned "missing value" after %s attempt(s) — likely a timeout (slow sync XHR?) or the JS returned undefined. Wrap JS in an IIFE that returns a serializable value, or fetch less per call.\n' "$retries" >&2
+    printf '%s' "$out"
+    return 1
+}
+
+# --- Page commands ---
+
+cmd_nav() {
+    local url="${1:?Usage: web nav <url>}"
+    local url_q
+    url_q=$(json_quote "$url")
+    run_js "location.href=$url_q"
+    echo "Navigated current tab to: $url"
+    echo "(Use 'web newtab <url>' to open in a new tab instead.)"
+}
+
+cmd_text() {
+    if [[ -n "$TAB_TARGET" ]]; then
+        run_js "document.body ? document.body.innerText : ''"
+    else
+        cua-driver call page "{\"pid\":$PID,\"window_id\":$WID,\"action\":\"get_text\"}" --compact 2>&1
+    fi
+}
+
+cmd_summary() {
+    run_js "(()=>{const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const label=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||'').trim();const h=Array.from(document.querySelectorAll('h1,h2,h3')).filter(visible).map(e=>label(e).slice(0,80)).filter(Boolean).slice(0,10);const b=Array.from(document.querySelectorAll('button,input[type=submit],input[type=button],[role=button]')).filter(visible).map(e=>({text:label(e).slice(0,60),disabled:!!e.disabled,id:e.id||''})).slice(0,20);const l=Array.from(document.querySelectorAll('a[href]')).filter(a=>visible(a)&&label(a)).map(a=>({text:label(a).slice(0,60),href:a.href})).slice(0,25);const f=Array.from(document.querySelectorAll('input,textarea,select')).filter(e=>visible(e)&&e.type!=='hidden').map(e=>({tag:e.tagName,type:e.type||'',name:e.name||e.id||'',placeholder:e.placeholder||'',value:(e.value||'').slice(0,40)})).slice(0,15);return JSON.stringify({url:location.href,title:document.title,headings:h,buttons:b,links:l,forms:f,scroll:Math.round(window.scrollY),ready:document.readyState})})()"
+}
+
+cmd_url() { run_js "location.href"; }
+cmd_title() { run_js "document.title"; }
+
+cmd_find() {
+    local selector_q
+    selector_q=$(json_quote "${1:?Usage: web find <selector>}")
+    run_js "(()=>{const selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);return JSON.stringify(Array.from(document.querySelectorAll(selector)).filter(visible).map((e,i)=>({i,tag:e.tagName,text:(e.innerText||e.value||'').trim().slice(0,100),href:e.href||'',id:e.id||'',cls:(e.className||'').toString().slice(0,80),type:e.type||'',name:e.name||'',placeholder:e.placeholder||''})))})()"
+}
+
+cmd_find_text() {
+    local text_q selector_q
+    text_q=$(json_quote "${1:?Usage: web find-text <text>}")
+    selector_q=$(json_quote "${2:-a,button,input,select,textarea,[role],label,[onclick]}")
+    run_js "(()=>{const needle=$text_q;const selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||'');return JSON.stringify(Array.from(document.querySelectorAll(selector)).filter(e=>visible(e)&&txt(e).toLowerCase().includes(needle.toLowerCase())).map((e,i)=>({i,tag:e.tagName,text:txt(e).trim().slice(0,100),href:e.href||'',id:e.id||'',cls:(e.className||'').toString().slice(0,80),type:e.type||'',name:e.name||'',placeholder:e.placeholder||''})))})()"
+}
+
+cmd_find_links() {
+    local text_q
+    text_q=$(json_quote "${1:-}")
+    run_js "(()=>{const needle=$text_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);return JSON.stringify(Array.from(document.querySelectorAll('a[href]')).filter(a=>visible(a)&&(a.innerText||'').trim()&&(!needle||(a.innerText||'').toLowerCase().includes(needle.toLowerCase()))).map((a,i)=>({i,text:a.innerText.trim().slice(0,100),href:a.href})).slice(0,80))})()"
+}
+
+cmd_find_buttons() {
+    local text_q
+    text_q=$(json_quote "${1:-}")
+    run_js "(()=>{const needle=$text_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||'');return JSON.stringify(Array.from(document.querySelectorAll('button,input[type=submit],input[type=button],[role=button]')).filter(b=>visible(b)&&(!needle||txt(b).toLowerCase().includes(needle.toLowerCase()))).map((b,i)=>({i,text:txt(b).trim().slice(0,80),id:b.id||'',cls:(b.className||'').toString().slice(0,80),type:b.type||'',disabled:!!b.disabled})).slice(0,80))})()"
+}
+
+cmd_find_inputs() {
+    run_js "(()=>{const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);return JSON.stringify(Array.from(document.querySelectorAll('input,textarea,select')).filter(e=>visible(e)&&e.type!=='hidden').map((e,i)=>({i,tag:e.tagName,type:e.type||'',name:e.name||'',id:e.id||'',value:(e.value||'').slice(0,80),placeholder:e.placeholder||'',label:(e.labels&&e.labels[0]?e.labels[0].innerText.trim().slice(0,80):''),required:!!e.required})).slice(0,100))})()"
+}
+
+cmd_click() {
+    local selector_q
+    selector_q=$(json_quote "${1:?Usage: web click <selector>}")
+    run_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});e.scrollIntoView({block:'center',inline:'center'});e.click();return JSON.stringify({clicked:true,tag:e.tagName,text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim().slice(0,80)})})()"
+}
+
+cmd_click_text() {
+    local text_q selector_q
+    text_q=$(json_quote "${1:?Usage: web click-text <text>}")
+    selector_q=$(json_quote "${2:-a,button,input,select,textarea,[role],label,[onclick]}")
+    run_js "(()=>{const needle=$text_q;const selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||'');const found=Array.from(document.querySelectorAll(selector)).find(e=>visible(e)&&txt(e).toLowerCase().includes(needle.toLowerCase()));if(!found)return JSON.stringify({error:'No element found with text',text:needle});found.scrollIntoView({block:'center',inline:'center'});found.click();return JSON.stringify({clicked:true,tag:found.tagName,text:txt(found).trim().slice(0,80),href:found.href||''})})()"
+}
+
+cmd_fill() {
+    local selector_q value_q
+    selector_q=$(json_quote "${1:?Usage: web fill <selector> <value>}")
+    value_q=$(json_quote "${2:?Usage: web fill <selector> <value>}")
+    run_js "(()=>{const selector=$selector_q;const value=$value_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});e.scrollIntoView({block:'center',inline:'center'});e.focus();if(e.tagName.toLowerCase()==='select'){e.value=value;e.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({filled:true,tag:'SELECT',value:e.value})}const proto=Object.getPrototypeOf(e);const desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(e,value);else e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({filled:true,tag:e.tagName,value:(e.value||'').slice(0,100)})})()"
+}
+
+cmd_select() {
+    local selector_q option_q
+    selector_q=$(json_quote "${1:?Usage: web select <selector> <option-text>}")
+    option_q=$(json_quote "${2:?Usage: web select <selector> <option-text>}")
+    run_js "(()=>{const selector=$selector_q;const needle=$option_q;const s=document.querySelector(selector);if(!s||s.tagName!=='SELECT')return JSON.stringify({error:'Select not found',selector});const opt=Array.from(s.options).find(o=>o.text.toLowerCase().includes(needle.toLowerCase())||o.value.toLowerCase()===needle.toLowerCase());if(!opt)return JSON.stringify({error:'Option not found',option:needle});s.value=opt.value;s.dispatchEvent(new Event('input',{bubbles:true}));s.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({selected:true,value:opt.value,text:opt.text})})()"
+}
+
+cmd_submit() {
+    local selector_q
+    selector_q=$(json_quote "${1:?Usage: web submit <form-selector>}")
+    run_js "(()=>{const selector=$selector_q;const f=document.querySelector(selector);if(!f)return JSON.stringify({error:'Form not found',selector});const ev=new Event('submit',{bubbles:true,cancelable:true});const notCancelled=f.dispatchEvent(ev);if(notCancelled){if(typeof f.requestSubmit==='function')f.requestSubmit();else f.submit()}return JSON.stringify({submitted:true,cancelled:!notCancelled})})()"
+}
+
+cmd_scroll() {
+    local pixels="${1:?Usage: web scroll <pixels>}"
+    [[ "$pixels" =~ ^-?[0-9]+$ ]] || { echo "Error: pixels must be an integer" >&2; exit 1; }
+    run_js "(()=>{window.scrollBy(0,$pixels);return JSON.stringify({scrolled:true,at:Math.round(window.scrollY)})})()"
+}
+
+cmd_run() {
+    [[ $# -gt 0 ]] || { echo "Usage: web run <js>" >&2; exit 1; }
+    run_js "$*"
+}
+
+cmd_wait() {
+    local ms="${1:?Usage: web wait <milliseconds>}"
+    [[ "$ms" =~ ^[0-9]+$ ]] || { echo "Error: milliseconds must be an integer" >&2; exit 1; }
+    local step=500 elapsed=0 result
+    # First check — return immediately if already loaded
+    result=$(run_js "JSON.stringify({ready:document.readyState==='complete',state:document.readyState,url:location.href,title:document.title,ms:0})")
+    if printf '%s' "$result" | grep -q '"ready":true'; then
+        printf '%s\n' "$result"
+        return 0
+    fi
+    # Poll in 500ms increments, stop as soon as page is ready or budget expires
+    while (( elapsed < ms )); do
+        sleep 0.5 2>/dev/null || sleep 1
+        (( elapsed += step )) || true
+        result=$(run_js "JSON.stringify({ready:document.readyState==='complete',state:document.readyState,url:location.href,title:document.title,ms:$elapsed})")
+        if printf '%s' "$result" | grep -q '"ready":true'; then
+            printf '%s\n' "$result"
+            return 0
+        fi
+    done
+    printf '%s\n' "$result"
+}
+
+cmd_cart() {
+    run_js "(()=>{try{var x=new XMLHttpRequest();x.open('GET','/cart.js',false);x.send();var c=JSON.parse(x.responseText);return JSON.stringify({item_count:c.item_count,total:'$'+(c.total_price/100),items:(c.items||[]).map(i=>({title:i.title,qty:i.quantity,price:'$'+(i.price/100)}))})}catch(e){return JSON.stringify({error:'Not a Shopify site or cart unavailable',message:String(e&&e.message||e)})}})()"
+}
+
+cmd_exists() {
+    local selector_q
+    selector_q=$(json_quote "${1:?Usage: web exists <selector>}")
+    run_js "(()=>{const selector=$selector_q;return JSON.stringify({selector,exists:!!document.querySelector(selector),count:document.querySelectorAll(selector).length})})()"
+}
+
+cmd_value() {
+    local selector_q
+    selector_q=$(json_quote "${1:?Usage: web value <selector>}")
+    run_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});return JSON.stringify({tag:e.tagName,value:e.value||'',text:(e.innerText||'').trim().slice(0,300),checked:!!e.checked,selected:e.selectedIndex})})()"
+}
+
+# --- Chrome tabs via AppleScript ---
+
+cmd_tabs() {
+    ensure_session
+    osascript - "$SESSION_WINDOW_ID" "$SESSION_TAB_ID" <<'APPLESCRIPT'
+on run argv
+  set sessionWindowId to item 1 of argv
+  set sessionTabId to item 2 of argv
+  set output to "target" & (ASCII character 9) & "window_id" & (ASCII character 9) & "tab_id" & (ASCII character 9) & "title" & (ASCII character 9) & "url" & (ASCII character 9) & "markers" & linefeed
+  set d to ASCII character 9
+  tell application "Google Chrome"
+    set windowIndex to 0
+    repeat with w in windows
+      set windowIndex to windowIndex + 1
+      set activeId to id of active tab of w as text
+      set tabIndex to 0
+      repeat with t in tabs of w
+        set tabIndex to tabIndex + 1
+        set marker to ""
+        if (id of t as text) is activeId then set marker to "active"
+        if (id of w as text) is sessionWindowId then
+          if marker is not "" then set marker to marker & ","
+          set marker to marker & "bot-window"
+        end if
+        if (id of t as text) is sessionTabId then
+          if marker is not "" then set marker to marker & ","
+          set marker to marker & "bot-session"
+        end if
+        set output to output & windowIndex & "." & tabIndex & d & (id of w as text) & d & (id of t as text) & d & title of t & d & URL of t & d & marker & linefeed
+      end repeat
+    end repeat
+  end tell
+  return output
+end run
+APPLESCRIPT
+}
+
+cmd_switch() {
+    local target="${1:?Usage: web switch <index|url|title>}" result
+    ensure_session
+    capture_ui_context
+    result=$(osascript - "$SESSION_WINDOW_ID" "$target" <<'APPLESCRIPT'
+on run argv
+  set wantedWindow to item 1 of argv
+  set needle to item 2 of argv
+  tell application "Google Chrome"
+    set targetWindow to missing value
+    repeat with w in windows
+      if (id of w as text) is wantedWindow then set targetWindow to w
+    end repeat
+    if targetWindow is missing value then return "0"
+    try
+      set tabIndex to needle as integer
+      if tabIndex ≥ 1 and tabIndex ≤ (count of tabs of targetWindow) then
+        set active tab index of targetWindow to tabIndex
+        return id of tab tabIndex of targetWindow as text
+      end if
+    end try
+    set tabIndex to 0
+    repeat with t in tabs of targetWindow
+      set tabIndex to tabIndex + 1
+      if URL of t contains needle or title of t contains needle or (id of t as text) is needle then
+        set active tab index of targetWindow to tabIndex
+        return id of t as text
+      end if
+    end repeat
+    return "0"
+  end tell
+end run
+APPLESCRIPT
+)
+    restore_ui_context
+    if [[ "$result" == "0" ]]; then
+        echo "No Pi Automation tab found matching: $target" >&2
+        return 1
+    fi
+    SESSION_TAB_ID="$result"
+    save_session
+    echo "Switched Pi Automation to tab id $result"
+}
+
+cmd_newtab() {
+    local url="${1:?Usage: web newtab <url>}" result
+    ensure_session
+    capture_ui_context
+    result=$(osascript - "$SESSION_WINDOW_ID" "$url" <<'APPLESCRIPT'
+on run argv
+  set wantedWindow to item 1 of argv
+  set targetUrl to item 2 of argv
+  tell application "Google Chrome"
+    repeat with w in windows
+      if (id of w as text) is wantedWindow then
+        set newTab to make new tab at end of tabs of w with properties {URL:targetUrl}
+        return id of newTab as text
+      end if
+    end repeat
+  end tell
+  error "Pi Automation window not found"
+end run
+APPLESCRIPT
+)
+    SESSION_TAB_ID="$result"
+    save_session
+    restore_ui_context
+    echo "Opened Pi Automation tab id $result: $url"
+}
+
+cmd_closetab() {
+    local target="${1:?Usage: web closetab <index|url|title>}" result closed_id remaining_id
+    ensure_session
+    capture_ui_context
+    result=$(osascript - "$SESSION_WINDOW_ID" "$target" <<'APPLESCRIPT'
+on run argv
+  set wantedWindow to item 1 of argv
+  set needle to item 2 of argv
+  set d to ASCII character 9
+  tell application "Google Chrome"
+    set targetWindow to missing value
+    repeat with w in windows
+      if (id of w as text) is wantedWindow then set targetWindow to w
+    end repeat
+    if targetWindow is missing value then return "0"
+    set targetTab to missing value
+    try
+      set tabIndex to needle as integer
+      if tabIndex ≥ 1 and tabIndex ≤ (count of tabs of targetWindow) then set targetTab to tab tabIndex of targetWindow
+    end try
+    if targetTab is missing value then
+      repeat with t in tabs of targetWindow
+        if URL of t contains needle or title of t contains needle or (id of t as text) is needle then
+          set targetTab to t
+          exit repeat
+        end if
+      end repeat
+    end if
+    if targetTab is missing value then return "0"
+    set closedId to id of targetTab as text
+    close targetTab
+    delay 0.05
+    return closedId & d & (id of active tab of targetWindow as text)
+  end tell
+end run
+APPLESCRIPT
+)
+    restore_ui_context
+    if [[ "$result" == "0" ]]; then
+        echo "No Pi Automation tab found matching: $target" >&2
+        return 1
+    fi
+    IFS=$'\t' read -r closed_id remaining_id <<< "$result"
+    if [[ "$SESSION_TAB_ID" == "$closed_id" ]]; then SESSION_TAB_ID="$remaining_id"; fi
+    save_session
+    echo "Closed Pi Automation tab id $closed_id"
+}
+
+resolve_target_record() {
+    local target="$1"
+    osascript - "$target" "$WEB_SESSION_NAME" <<'APPLESCRIPT'
+on run argv
+  set needle to item 1 of argv
+  set sessionName to item 2 of argv
+  set d to ASCII character 9
+  tell application "Google Chrome"
+    set targetWindow to missing value
+    set targetTab to missing value
+    set sessionWindow to missing value
+    repeat with w in windows
+      try
+        if (given name of w as text) is sessionName then set sessionWindow to w
+      end try
+    end repeat
+    if needle is "session" or needle is "bot" then
+      if sessionWindow is not missing value then
+        set targetWindow to sessionWindow
+        set targetTab to active tab of sessionWindow
+      end if
+    else if needle is "active" or needle is "__active__" then
+      if (count of windows) > 0 then
+        set targetWindow to window 1
+        set targetTab to active tab of window 1
+      end if
+    else if needle starts with "tab:" then
+      set wantedId to text 5 thru -1 of needle
+      repeat with w in windows
+        repeat with t in tabs of w
+          if (id of t as text) is wantedId then
+            set targetWindow to w
+            set targetTab to t
+            exit repeat
+          end if
+        end repeat
+        if targetTab is not missing value then exit repeat
+      end repeat
+    else
+      if sessionWindow is not missing value then
+        repeat with t in tabs of sessionWindow
+          if URL of t contains needle or title of t contains needle or (id of t as text) is needle then
+            set targetWindow to sessionWindow
+            set targetTab to t
+            exit repeat
+          end if
+        end repeat
+      end if
+      if targetTab is missing value then
+        repeat with w in windows
+          repeat with t in tabs of w
+            if URL of t contains needle or title of t contains needle or (id of t as text) is needle then
+              set targetWindow to w
+              set targetTab to t
+              exit repeat
+            end if
+          end repeat
+          if targetTab is not missing value then exit repeat
+        end repeat
+      end if
+    end if
+    if targetTab is missing value then error "No Chrome tab matches: " & needle
+    set b to bounds of targetWindow
+    return (id of targetWindow as text) & d & (id of targetTab as text) & d & (item 1 of b as text) & d & (item 2 of b as text) & d & (item 3 of b as text) & d & (item 4 of b as text) & d & (title of targetTab as text) & d & (URL of targetTab as text)
+  end tell
+end run
+APPLESCRIPT
+}
+
+cmd_resolve() {
+    local target="${1:-session}" record
+    if [[ "$target" == "session" || "$target" == "bot" ]]; then
+        ensure_session
+    else
+        record=$(resolve_target_record "$target")
+        parse_session_record "$record"
+    fi
+    printf '{"windowId":%s,"tabId":%s,"target":"tab:%s","bounds":%s,"title":%s,"url":%s}\n' \
+        "$SESSION_WINDOW_ID" "$SESSION_TAB_ID" "$SESSION_TAB_ID" "$(json_quote "$SESSION_BOUNDS")" \
+        "$(json_quote "$SESSION_TITLE")" "$(json_quote "$SESSION_URL")"
+}
+
+cmd_bind() {
+    local target="${1:-active}" record old_window
+    load_session
+    old_window="$SESSION_WINDOW_ID"
+    record=$(resolve_target_record "$target")
+    parse_session_record "$record"
+    osascript - "$old_window" "$SESSION_WINDOW_ID" "$WEB_SESSION_NAME" <<'APPLESCRIPT'
+on run argv
+  set oldId to item 1 of argv
+  set newId to item 2 of argv
+  set sessionName to item 3 of argv
+  tell application "Google Chrome"
+    repeat with w in windows
+      if (id of w as text) is oldId and oldId is not newId then
+        try
+          set given name of w to ""
+        end try
+      end if
+      if (id of w as text) is newId then set given name of w to sessionName
+    end repeat
+  end tell
+end run
+APPLESCRIPT
+    save_session
+    cmd_session
+}
+
+show_help() {
+    cat <<'HELP'
+web — fast live-Chrome browser interaction via cua-driver
+
+SESSION:
+  web session                   # Persistent Pi Automation window/tab
+  web bind [active|url|title]   # Intentionally move the bot session to a chosen tab
+  web --tab <active|N|url|title|tab:ID> ... # Explicit one-call target override
+
+NAVIGATION:
+  web nav <url>                 # Go to URL in active tab
+  web url / title               # Current URL / title
+  web wait <ms>                 # Check readyState, sleep only if not complete
+
+READING:
+  web summary                   # Title, headings, buttons, links, forms
+  web text                      # Full visible page text
+  web find <selector>           # Elements by CSS selector
+  web find-text <text> [tags]   # Elements by text
+  web find-links [text]         # Links, optionally filtered by text
+  web find-buttons [text]       # Buttons, optionally filtered by text
+  web find-inputs               # Form inputs
+  web exists <selector>         # Does element exist?
+  web value <selector>          # Read element value/text
+
+ACTIONS:
+  web click <selector>          # Click by CSS selector
+  web click-text <text> [tags]  # Click by visible text
+  web fill <selector> <value>   # Fill input + fire input/change events
+  web select <selector> <text>  # Select dropdown option by text/value
+  web submit <form>             # Submit form
+  web scroll <pixels>           # Scroll (positive down, negative up)
+
+TABS (AppleScript, no pid/wid needed):
+  web tabs                      # List every Chrome window/tab and bot markers
+  web switch <N|url|title>      # Switch inside the Pi Automation window
+  web newtab <url>              # Open a tab in Pi Automation and remember it
+  web closetab <N|url|title>    # Close a Pi Automation tab
+
+ADVANCED:
+  web run <js>                  # Run synchronous JS in active page
+  web cart                      # Shopify cart contents
+
+IMPORTANT:
+  - With no --tab, commands stay on the persistent, named Pi Automation window/tab across turns.
+  - --tab active is an explicit opt-in to the user's currently active Chrome tab.
+  - Pi Automation is a second window in the same normal Chrome process/profile—not a second login session.
+  - --tab targets any Chrome tab in the background through Apple Events; the user can keep working elsewhere.
+  - switch/newtab do not activate Chrome or steal focus.
+  - Use this instead of AX tree for web content.
+  - For async-like page/network work inside JS, use synchronous XMLHttpRequest.
+  - Tab commands use AppleScript; page commands use cua-driver page tools.
+HELP
+}
+
+# --- Main ---
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+    auto)         cmd_auto ;;
+    session)      cmd_session ;;
+    resolve)      cmd_resolve "${1:-session}" ;;
+    bind)         cmd_bind "${1:-active}" ;;
+    tabs)         cmd_tabs ;;
+    switch)       cmd_switch "${1:?Usage: web switch <index|url|title>}" ;;
+    newtab)       cmd_newtab "${1:?Usage: web newtab <url>}" ;;
+    closetab)     cmd_closetab "${1:?Usage: web closetab <index|url|title>}" ;;
+    nav)          ensure_target; cmd_nav "${1:?Usage: web nav <url>}" ;;
+    summary)      ensure_target; cmd_summary ;;
+    text)         ensure_target; cmd_text ;;
+    url)          ensure_target; cmd_url ;;
+    title)        ensure_target; cmd_title ;;
+    find)         ensure_target; cmd_find "${1:?Usage: web find <selector>}" ;;
+    find-text)    ensure_target; cmd_find_text "${1:?Usage: web find-text <text>}" "${2:-}" ;;
+    find-links)   ensure_target; cmd_find_links "${1:-}" ;;
+    find-buttons) ensure_target; cmd_find_buttons "${1:-}" ;;
+    find-inputs)  ensure_target; cmd_find_inputs ;;
+    click)        ensure_target; cmd_click "${1:?Usage: web click <selector>}" ;;
+    click-text)   ensure_target; cmd_click_text "${1:?Usage: web click-text <text>}" "${2:-}" ;;
+    fill)         ensure_target; cmd_fill "${1:?Usage: web fill <selector> <value>}" "${2:?Usage: web fill <selector> <value>}" ;;
+    select)       ensure_target; cmd_select "${1:?Usage: web select <selector> <option-text>}" "${2:?Usage: web select <selector> <option-text>}" ;;
+    submit)       ensure_target; cmd_submit "${1:?Usage: web submit <form-selector>}" ;;
+    scroll)       ensure_target; cmd_scroll "${1:?Usage: web scroll <pixels>}" ;;
+    run)          ensure_target; cmd_run "$@" ;;
+    wait)         ensure_target; cmd_wait "${1:?Usage: web wait <milliseconds>}" ;;
+    cart)         ensure_target; cmd_cart ;;
+    exists)       ensure_target; cmd_exists "${1:?Usage: web exists <selector>}" ;;
+    value)        ensure_target; cmd_value "${1:?Usage: web value <selector>}" ;;
+    help|--help|-h) show_help ;;
+    *)
+        echo "Unknown command: $cmd. Run 'web help'." >&2
+        exit 1
+        ;;
+esac

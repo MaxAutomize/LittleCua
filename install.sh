@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # One-command installer for pi-cua-webcli.
-# Checks/installs Node, Pi, the native runtimes (CuaDriver + web CLI), then
-# registers this package with Pi. Safe to re-run.
+# Checks/installs Node, Pi, the native runtimes (CuaDriver + the web Chrome shim),
+# then registers this package with Pi. Safe to re-run.
+#
+# macOS only — both tools drive macOS-native runtimes (CuaDriver.app + AppleScript).
 set -euo pipefail
 
 BOLD="\033[1m"; GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; RESET="\033[0m"
@@ -10,6 +12,12 @@ warn() { printf "${BOLD}${YELLOW}!! ${RESET} %s\n" "$1"; }
 err() { printf "${BOLD}${RED}XX ${RESET} %s\n" "$1" >&2; }
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# --- OS guard ---------------------------------------------------------------
+if [ "$(uname -s)" != "Darwin" ]; then
+  err "This package is macOS-only (CuaDriver.app + AppleScript). Found $(uname -s)."
+  exit 1
+fi
 
 # --- Node ------------------------------------------------------------------
 if ! command -v node >/dev/null 2>&1; then
@@ -40,14 +48,20 @@ else
   say "CuaDriver OK ($CUA_BIN)"
 fi
 
-# --- web CLI (native runtime for web_cli) ---------------------------------
+# --- web CLI shim (native runtime for web_cli, bundled here) ---------------
 WEB_BIN="${WEB_CLI_PATH:-$HOME/.local/bin/web}"
-if [ ! -x "$WEB_BIN" ] && ! command -v web >/dev/null 2>&1; then
-  warn "web CLI not found at $WEB_BIN or on PATH."
-  warn "  Install with:  npm install -g @earendil-works/agent-browser"
-  warn "  (or place a binary at ~/.local/bin/web)"
+mkdir -p "$HOME/.local/bin"
+if [ -f "$REPO_DIR/scripts/web" ]; then
+  cp "$REPO_DIR/scripts/web" "$WEB_BIN"
+  chmod +x "$WEB_BIN"
+  say "web shim installed → $WEB_BIN"
 else
-  say "web CLI OK"
+  warn "scripts/web not found in repo; web_cli will need WEB_CLI_PATH set or a 'web' binary on PATH."
+fi
+
+# --- Chrome ----------------------------------------------------------------
+if [ ! -d "/Applications/Google Chrome.app" ]; then
+  warn "Google Chrome not found in /Applications. web_cli needs Chrome + its AppleScript dictionary."
 fi
 
 # --- Register this package with Pi ----------------------------------------

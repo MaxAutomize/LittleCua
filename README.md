@@ -4,8 +4,8 @@ Two [Pi](https://pi.dev) coding-agent extensions, packaged together so a single 
 
 | Tool | Extension | What it does |
 |------|-----------|--------------|
-| `cua_driver` | `extensions/cua-tool` | Drive native macOS apps (Xcode, Finder, System Settings, Blender, …) via the CuaDriver daemon — screenshots, clicks, typing, semantic AX selectors, 30-step workflows, AppleScript. |
-| `web_cli`   | `extensions/web-cli` | Fast DOM control of your live authenticated Chrome — navigate, read text, find/click/fill buttons & inputs, run JS, manage tabs, chain 30-step sequences. |
+| `cua_driver` | `extensions/cua-tool` | Drive native macOS apps (Xcode, Finder, System Settings, Blender, …) via the CuaDriver daemon — screenshots, clicks, typing, semantic AX selectors, 30-step workflows, AppleScript. **macOS only.** |
+| `web_cli`   | `extensions/web-cli` | Fast DOM control of your live authenticated Chrome (macOS) via a bundled AppleScript + cua-driver shim — navigate, read text, find/click/fill buttons & inputs, run JS, manage tabs, chain 30-step sequences. |
 
 Both register as LLM-callable tools inside Pi, so once installed the model can use them directly.
 
@@ -57,7 +57,7 @@ Reload Pi (or run `/reload`) after installing to pick up the new tools.
 
 ## 3. Install the native runtimes these tools drive
 
-The extensions are thin TypeScript wrappers around two native binaries. Pi + the extensions handle the agent side; you still need the binaries themselves on macOS.
+> **macOS only.** Both tools are thin TypeScript wrappers around macOS-native runtimes. `cua_driver` shells out to **CuaDriver.app**, and `web_cli` shells out to a custom **`web` bash shim** that drives Chrome through **AppleScript** (`osascript`) and CuaDriver's page tools. Neither AppleScript nor CuaDriver exist on Windows/Linux, so this whole package is macOS-only. The extension TypeScript itself is plain cross-platform code; only the runtimes it calls are macOS-bound.
 
 ### cua_driver → CuaDriver.app
 
@@ -81,22 +81,31 @@ The extension auto-detects `/Applications/CuaDriver.app/Contents/MacOS/cua-drive
 export CUA_DRIVER_BIN=/path/to/cua-driver
 ```
 
-### web_cli → the `web` browser CLI
+### web_cli → the `web` Chrome shim (bundled in this repo)
+
+`web_cli` does **not** use the cross-platform `agent-browser` npm CLI — it calls a custom bash shim that controls your live Chrome via AppleScript + CuaDriver page tools. That shim is shipped in this repo at `scripts/web`, so you don't have to fetch it separately.
+
+Install it onto your `PATH`:
 
 ```bash
-# Install the agent-browser web CLI (provides the `web` binary)
-npm install -g @earendil-works/agent-browser
-# or put the binary at ~/.local/bin/web
+# From the repo root
+mkdir -p ~/.local/bin
+cp scripts/web ~/.local/bin/web
+chmod +x ~/.local/bin/web
+# Ensure ~/.local/bin is on PATH (add to ~/.zshrc / ~/.bashrc if not)
+export PATH="$HOME/.local/bin:$PATH"
 
 # Verify
-web --help
+web --help   # prints the QUICK START usage
 ```
 
-The extension looks for `~/.local/bin/web` first, then falls back to `web` on `PATH`. Override with:
+The extension looks for `~/.local/bin/web` first, then falls back to `web` on `PATH`. Point it elsewhere with:
 
 ```bash
 export WEB_CLI_PATH=/path/to/web
 ```
+
+Requirements for the shim: **macOS**, **Google Chrome** installed, and **CuaDriver.app** present (the shim uses `cua-driver call page ...` for JS execution and text extraction). Grant Chrome the same Accessibility permissions you gave CuaDriver.
 
 You also need a Chrome logged into the account you want the agent to use. `web_cli` targets a persistent named "Pi Automation" window in your existing Chrome profile — it does **not** open a separate headless browser and does **not** take over your active tab.
 
@@ -110,7 +119,7 @@ cd pi-cua-webcli
 ./install.sh
 ```
 
-`install.sh` checks for Node/Pi/the native binaries, installs Pi if missing, then runs `pi install` on the local checkout. It is idempotent — safe to re-run.
+`install.sh` checks for Node/Pi/the native binaries, installs Pi if missing, installs the bundled `web` shim to `~/.local/bin/web`, then runs `pi install` on the local checkout. It is idempotent — safe to re-run.
 
 ---
 
@@ -141,6 +150,8 @@ pi-cua-webcli/
 ├── package.json                 # Pi package manifest (declares extensions)
 ├── install.sh                   # One-command setup helper
 ├── README.md
+├── scripts/
+│   └── web                      # macOS-only Chrome shim (AppleScript + cua-driver)
 └── extensions/
     ├── cua-tool/
     │   ├── index.ts              # cua_driver tool
@@ -157,11 +168,12 @@ The extensions are loaded via [jiti](https://github.com/unjs/jiti), so TypeScrip
 
 ## Notes & requirements
 
-- **macOS only** — both native runtimes are macOS apps.
+- **macOS only** — `cua_driver` needs CuaDriver.app, and `web_cli` needs the bundled `web` shim which uses AppleScript + cua-driver. None of those exist on Windows/Linux. (The TypeScript extension code itself is cross-platform; only the runtimes it calls are macOS-bound.)
 - Node 18+.
-- Accessibility + Screen Recording permissions for CuaDriver.
+- Google Chrome installed.
+- Accessibility + Screen Recording permissions for CuaDriver (and Chrome, for the AppleScript path).
 - A Chrome profile logged into the accounts you want `web_cli` to use.
-- This package runs with full system access (all Pi extensions do). Review the source in `extensions/` before installing — it's short and readable.
+- This package runs with full system access (all Pi extensions do). Review the source in `extensions/` and `scripts/web` before installing — it's short and readable.
 
 ## License
 
