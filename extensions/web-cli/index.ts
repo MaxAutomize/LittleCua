@@ -10,6 +10,7 @@ const Action = StringEnum([
   "url",
   "title",
   "wait",
+  "sleep",
   "summary",
   "text",
   "find",
@@ -21,7 +22,11 @@ const Action = StringEnum([
   "value",
   "click",
   "click-text",
+  "trusted-click",
+  "trusted-click-text",
+  "press",
   "fill",
+  "type",
   "select",
   "submit",
   "scroll",
@@ -32,6 +37,7 @@ const Action = StringEnum([
   "newtab",
   "closetab",
   "run",
+  "run-main",
   "cart",
   "sequence",
 ] as const);
@@ -43,9 +49,9 @@ const ReadAfter = StringEnum(["none", "summary", "text"] as const, {
 
 const SequenceStep = Type.Object({
   action: StringEnum([
-    "nav", "url", "title", "wait", "summary", "text", "find", "find-text", "find-links",
-    "find-buttons", "find-inputs", "exists", "value", "click", "click-text", "fill", "select",
-    "submit", "scroll", "session", "bind", "tabs", "switch", "newtab", "closetab", "run", "cart",
+    "nav", "url", "title", "wait", "sleep", "summary", "text", "find", "find-text", "find-links",
+    "find-buttons", "find-inputs", "exists", "value", "click", "click-text", "trusted-click", "trusted-click-text", "press", "fill", "type", "select",
+    "submit", "scroll", "session", "bind", "tabs", "switch", "newtab", "closetab", "run", "run-main", "cart",
   ] as const),
   tab: Type.Optional(Type.String()),
   url: Type.Optional(Type.String()),
@@ -58,6 +64,8 @@ const SequenceStep = Type.Object({
   ms: Type.Optional(Type.Number()),
   pixels: Type.Optional(Type.Number()),
   javascript: Type.Optional(Type.String()),
+  key: Type.Optional(Type.String()),
+  modifiers: Type.Optional(Type.Array(Type.String())),
   timeoutMs: Type.Optional(Type.Number()),
 });
 
@@ -66,14 +74,16 @@ const Params = Type.Object({
   tab: Type.Optional(Type.String({ description: "Explicit target override: active, tab:ID, index, URL, or title. Omit to remain on the persistent Pi Automation session." })),
   url: Type.Optional(Type.String({ description: "URL for nav or newtab" })),
   readAfter: Type.Optional(ReadAfter),
-  selector: Type.Optional(Type.String({ description: "CSS selector for find/click/fill/select/submit/exists/value" })),
+  selector: Type.Optional(Type.String({ description: "CSS selector for find/click/fill/type/select/submit/exists/value" })),
   text: Type.Optional(Type.String({ description: "Visible text for find-text/click-text, or optional filter for find-links/find-buttons" })),
-  value: Type.Optional(Type.String({ description: "Value for fill or select" })),
+  value: Type.Optional(Type.String({ description: "Value for fill, type, or select" })),
   tags: Type.Optional(Type.String({ description: "Optional tag filter for find-text or click-text" })),
   target: Type.Optional(Type.String({ description: "Target for bind/switch/closetab: active, tab ID, index, URL, or title" })),
-  ms: Type.Optional(Type.Number({ description: "Milliseconds for wait" })),
+  ms: Type.Optional(Type.Number({ description: "Milliseconds: readiness budget for wait, fixed duration for sleep" })),
   pixels: Type.Optional(Type.Number({ description: "Scroll distance; positive is down, negative is up" })),
-  javascript: Type.Optional(Type.String({ description: "Synchronous JavaScript for run" })),
+  javascript: Type.Optional(Type.String({ description: "Synchronous JavaScript for run or run-main. run-main executes with page-owned framework state when inline injection is allowed." })),
+  key: Type.Optional(Type.String({ description: "Key for press, or optional commit key after type (return, tab, or escape)" })),
+  modifiers: Type.Optional(Type.Array(Type.String({ description: "Modifiers for press: cmd, shift, option, ctrl" }))),
   timeoutMs: Type.Optional(Type.Number({ description: "Command timeout in milliseconds" })),
   steps: Type.Optional(Type.Array(SequenceStep, { minItems: 1, maxItems: 30, description: "For action=sequence: run up to 30 live-Chrome operations in one model tool call" })),
   stopOnError: Type.Optional(Type.Boolean({ description: "For sequence: stop at the first failed step. Default true." })),
@@ -114,19 +124,26 @@ function buildArgs(params: Input): string[] {
       args.push(required(params.url, "url"));
       break;
     case "wait":
+    case "sleep":
       args.push(String(Math.max(0, Math.floor(params.ms ?? 1000))));
       break;
     case "find":
     case "exists":
     case "value":
     case "click":
+    case "trusted-click":
     case "submit":
       args.push(required(params.selector, "selector"));
       break;
     case "find-text":
     case "click-text":
+    case "trusted-click-text":
       args.push(required(params.text, "text"));
       if (params.tags) args.push(params.tags);
+      break;
+    case "press":
+      args.push(required(params.key, "key"));
+      if (params.modifiers?.length) args.push(params.modifiers.join(","));
       break;
     case "find-links":
     case "find-buttons":
@@ -135,6 +152,10 @@ function buildArgs(params: Input): string[] {
     case "fill":
     case "select":
       args.push(required(params.selector, "selector"), required(params.value, "value"));
+      break;
+    case "type":
+      args.push(required(params.selector, "selector"), required(params.value, "value"));
+      if (params.key) args.push(params.key);
       break;
     case "scroll":
       args.push(String(Math.trunc(params.pixels ?? 700)));
@@ -152,6 +173,7 @@ function buildArgs(params: Input): string[] {
       args.push(required(params.url, "url"));
       break;
     case "run":
+    case "run-main":
       args.push(required(params.javascript, "javascript"));
       break;
     case "sequence":
@@ -177,7 +199,8 @@ export default function (pi: ExtensionAPI) {
     description:
       "Fast one-call DOM control of the user's live, authenticated Chrome. By default every turn returns to one persistent, named Pi Automation window/tab in the same Chrome profile, rather than taking the user's current tab. " +
       "Explicit tab overrides can still address active, tab:ID, index, URL, or title in the background. Navigation internally waits for readiness and can return page content immediately. " +
-      "Sequence runs up to 30 operations against one stable tab ID without repeated model round-trips. " +
+      "Synthetic clicks and fills stay fast and background-safe; the dedicated Pi Automation session uses a cached cua-driver page channel instead of rescanning Chrome through AppleScript on every command. Trusted-click/press/type temporarily front the exact target for browser-gated controls and fields that require real character events, then restore the user's focus. " +
+      "Sequence runs up to 30 operations without repeated model round-trips, retaining the fast dedicated-session channel while pinning explicit non-session targets to stable tab IDs. " +
       "Use this before Cua for ordinary Chrome page work.",
     promptSnippet: "Fast DOM control in the persistent Pi Automation window of the user's authenticated Chrome; use before Cua",
     promptGuidelines: [
@@ -187,7 +210,10 @@ export default function (pi: ExtensionAPI) {
       "Omit tab to continue the persistent Pi Automation session across turns. This is a named second window in the user's existing Chrome process/profile, not a separate browser login or headless session.",
       "Use tab='active' only when the user explicitly asks to operate on their currently active Chrome tab. A tab:ID, index, URL, or title can target another tab directly in the background.",
       "Use action=session to inspect the remembered bot target and action=bind only when intentionally moving that persistent target. Never silently rebind to the user's active tab.",
-      "Use action=sequence for multi-step live-Chrome work. It resolves the chosen session/target to a stable Chrome tab ID at sequence start.",
+      "Use action=sequence for multi-step live-Chrome work. The dedicated session retains its cached exact automation-window channel; explicit active/tab/URL/title targets are pinned to a stable Chrome tab ID. Access is serialized so parallel calls cannot race the same automation session.",
+      "Use click/click-text and fill for normal fast DOM actions. Use type with a selector, value, and optional commit key when a custom or framework-controlled field displays the synthetic fill but does not update page state. Trusted actions briefly front the exact target and restore focus.",
+      "Use wait as a readiness budget—it returns immediately when readyState is complete. Use sleep when a fixed delay is required for SPA transitions, animation, or delayed validation.",
+      "web_cli fill first updates framework-controlled fields in the page's own JavaScript world while staying background-safe. Use run-main when page-owned JavaScript expandos or component state is essential; use type or Chrome DevTools through cua_driver only if a strict Content Security Policy blocks main-world injection.",
       "Call the needed web_cli action directly—never make a separate setup/auto call. Every action self-heals a stale target and opens Chrome only when necessary.",
       "For navigation, set readAfter='summary' or 'text' so one web_cli call launches/discovers Chrome, navigates, waits for readiness, and returns the page content needed for the task.",
       "Prefer summary or targeted find commands before full text when that yields enough context, and use one direct DOM action instead of sequences of pixel clicks.",
@@ -199,10 +225,13 @@ export default function (pi: ExtensionAPI) {
       if (params.action === "sequence") {
         if (!params.steps?.length) throw new Error("steps are required for web_cli sequence.");
         let pinnedTab = params.tab ?? "session";
+        const usesDedicatedSession = ["session", "bot"].includes(pinnedTab);
 
-        // Resolve the logical session/active/title target to Chrome's stable tab
-        // ID once. Window ordering and user tab changes cannot redirect the run.
-        if (!pinnedTab.startsWith("tab:")) {
+        // Keep the dedicated session logical so every step uses its cached exact
+        // native window through cua-driver. Explicit active/title/URL targets are
+        // still resolved once to a stable Chrome tab ID so user tab changes cannot
+        // redirect those runs.
+        if (!usesDedicatedSession && !pinnedTab.startsWith("tab:")) {
           const resolved = await pi.exec(binary, ["resolve", pinnedTab], { signal, timeout: 8_000 });
           if (resolved.code !== 0) throw new Error(String(resolved.stderr || resolved.stdout || `Could not resolve Chrome target ${pinnedTab}`));
           try {
@@ -238,7 +267,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const args = buildArgs(params);
-      const timeout = params.timeoutMs ?? (params.action === "wait" ? Math.max(10_000, (params.ms ?? 1000) + 10_000) : params.action === "run" ? 60_000 : 30_000);
+      const timeout = params.timeoutMs ?? (["wait", "sleep"].includes(params.action) ? Math.max(10_000, (params.ms ?? 1000) + 10_000) : params.action === "run" ? 60_000 : 30_000);
       onUpdate?.({ content: [{ type: "text", text: `${binary} ${args.map((arg) => JSON.stringify(arg)).join(" ")}` }] });
 
       const pageScope = ["--tab", params.tab ?? "session"];

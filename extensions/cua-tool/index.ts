@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, statSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "fs";
 import { Type, type Static } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import nativeWorkflowExtension, { nativeFastSchema } from "./native-workflow.ts";
@@ -70,6 +70,18 @@ function readableFileSize(path: string): string | undefined {
   }
 }
 
+function imageDimensions(path: string): { width: number; height: number } | undefined {
+  try {
+    const data = readFileSync(path);
+    if (data.length >= 24 && data.subarray(1, 4).toString("ascii") === "PNG") {
+      return { width: data.readUInt32BE(16), height: data.readUInt32BE(20) };
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function writeTempJson(prefix: string, data: unknown): string | undefined {
   try {
     const path = `/tmp/${prefix}-${Date.now()}.json`;
@@ -128,13 +140,15 @@ const driverSchema = Type.Object({
   onScreenOnly: Type.Optional(Type.Boolean()),
   query: Type.Optional(Type.String({ description: "Filter get_window_state tree_markdown to matching lines plus ancestors, or filter list_windows by app/title/pid/window_id." })),
   elementIndex: Type.Optional(Type.Number({ description: "element_index from the immediately preceding get_window_state." })),
-  x: Type.Optional(Type.Number()), y: Type.Optional(Type.Number()), x1: Type.Optional(Type.Number()), y1: Type.Optional(Type.Number()), x2: Type.Optional(Type.Number()), y2: Type.Optional(Type.Number()),
+  x: Type.Optional(Type.Number({ description: "Window-local screenshot pixel X. Use the PNG coordinate exactly—do not divide for Retina or add the window origin." })),
+  y: Type.Optional(Type.Number({ description: "Window-local screenshot pixel Y. Use the PNG coordinate exactly—do not divide for Retina or add the window origin." })),
+  x1: Type.Optional(Type.Number()), y1: Type.Optional(Type.Number()), x2: Type.Optional(Type.Number()), y2: Type.Optional(Type.Number()),
   fromX: Type.Optional(Type.Number()), fromY: Type.Optional(Type.Number()), toX: Type.Optional(Type.Number()), toY: Type.Optional(Type.Number()),
-  fromZoom: Type.Optional(Type.Boolean()),
+  fromZoom: Type.Optional(Type.Boolean({ description: "Set true only when x/y came from the last zoom image rather than the full window screenshot." })),
   axAction: Type.Optional(StringEnum(["press", "show_menu", "pick", "confirm", "cancel", "open"] as const)),
   modifiers: Type.Optional(Type.Array(Type.String(), { description: "Modifier keys: cmd/shift/option/ctrl/fn where supported." })),
   count: Type.Optional(Type.Number({ description: "Pixel click count 1-3 for click action." })),
-  debugImageOut: Type.Optional(Type.String({ description: "Debug crosshair image path for pixel click." })),
+  debugImageOut: Type.Optional(Type.String({ description: "Optional debug PNG with a red crosshair at the received screenshot-pixel coordinate." })),
   button: Type.Optional(StringEnum(["left", "right", "middle"] as const)),
   durationMs: Type.Optional(Type.Number()),
   steps: Type.Optional(Type.Number()),
@@ -206,7 +220,7 @@ function buildDriverArgs(p: DriverInput): string[] {
   if (p.action === "right_click") return driverToolArgs("right_click", { pid: needNumber(p.pid, "pid"), window_id: p.windowId, element_index: p.elementIndex, x: p.x, y: p.y, modifier: p.modifiers }, p);
   if (p.action === "drag") return driverToolArgs("drag", { pid: needNumber(p.pid, "pid"), window_id: p.windowId, from_x: needNumber(p.fromX, "fromX"), from_y: needNumber(p.fromY, "fromY"), to_x: needNumber(p.toX, "toX"), to_y: needNumber(p.toY, "toY"), from_zoom: p.fromZoom, modifier: p.modifiers, button: p.button, duration_ms: p.durationMs, steps: p.steps }, p);
   if (p.action === "type_text") return driverToolArgs("type_text", { pid: needNumber(p.pid, "pid"), window_id: p.windowId, element_index: p.elementIndex, text: need(p.text, "text"), delay_ms: p.delayMs }, p);
-  if (p.action === "type_text_chars") return driverToolArgs("type_text", { pid: needNumber(p.pid, "pid"), window_id: p.windowId, element_index: p.elementIndex, text: need(p.text, "text"), delay_ms: p.delayMs ?? 30 }, p);
+  if (p.action === "type_text_chars") throw new Error("type_text_chars is handled by the forced-keystroke execution path.");
   if (p.action === "set_value") return driverToolArgs("set_value", { pid: needNumber(p.pid, "pid"), window_id: needNumber(p.windowId, "windowId"), element_index: needNumber(p.elementIndex, "elementIndex"), value: String(p.value ?? "") }, p);
   if (p.action === "press_key") return driverToolArgs("press_key", { pid: needNumber(p.pid, "pid"), window_id: p.windowId, element_index: p.elementIndex, key: need(p.key, "key"), modifiers: p.modifiers }, p);
   if (p.action === "hotkey") return driverToolArgs("hotkey", { pid: needNumber(p.pid, "pid"), window_id: p.windowId, keys: needArray(p.keys, "keys") }, p);
@@ -350,6 +364,97 @@ async function runFullScreenScreenshot(pi: ExtensionAPI, params: DriverInput, si
   return result;
 }
 
+async function runForcedKeystrokes(pi: ExtensionAPI, params: DriverInput, signal: AbortSignal | undefined, onUpdate?: (partial: any) => void) {
+  const pid = needNumber(params.pid, "pid");
+  const text = need(params.text, "text");
+  const timeout = params.timeoutMs ?? CUA_TIMEOUT_MS;
+
+  // Focus an explicitly indexed element first when supplied. This preserves the
+  // exact target-window context before System Events temporarily fronts the app.
+  if (params.elementIndex !== undefined) {
+    const focus = await run(pi, CUA_DRIVER_BIN, driverToolArgs("click", {
+      pid,
+      window_id: params.windowId,
+      element_index: params.elementIndex,
+    }, { compact: true } as DriverInput), signal, timeout, onUpdate);
+    if (focus.isError) return focus;
+  }
+
+  const windows = await listDriverWindows(pi, false, signal, undefined, timeout);
+  const targetWindow = windows.find((window) => window.pid === pid && (params.windowId === undefined || window.window_id === params.windowId));
+  const appName = targetWindow?.app_name ?? "";
+  const windowTitle = targetWindow?.title ?? "";
+
+  onUpdate?.({ content: [{ type: "text", text: `Forcing ${text.length} character keystrokes to pid ${pid}${appName ? ` (${appName})` : ""}…` }] });
+  const script = `on run argv
+set targetPid to (item 1 of argv) as integer
+set payload to item 2 of argv
+set appName to item 3 of argv
+set targetTitle to item 4 of argv
+set priorPid to 0
+tell application "System Events"
+  try
+    set priorPid to unix id of first application process whose frontmost is true
+  end try
+end tell
+if appName is "Google Chrome" then
+  tell application "Google Chrome"
+    set foundWindow to false
+    repeat with w in windows
+      set windowName to ""
+      set activeTitle to ""
+      try
+        set windowName to given name of w as text
+      end try
+      try
+        set activeTitle to title of active tab of w as text
+      end try
+      if windowName is targetTitle or activeTitle is targetTitle then
+        set index of w to 1
+        set foundWindow to true
+        exit repeat
+      end if
+    end repeat
+    activate
+  end tell
+else
+  tell application "System Events"
+    set targetProcess to first application process whose unix id is targetPid
+    try
+      repeat with w in windows of targetProcess
+        if targetTitle is not "" and (name of w as text) contains targetTitle then
+          try
+            perform action "AXRaise" of w
+          end try
+          exit repeat
+        end if
+      end repeat
+    end try
+  end tell
+end if
+tell application "System Events"
+  set targetProcess to first application process whose unix id is targetPid
+  set frontmost of targetProcess to true
+end tell
+delay 0.1
+tell application "System Events" to keystroke payload
+delay 0.05
+tell application "System Events"
+  if priorPid is not 0 and priorPid is not targetPid then
+    try
+      set frontmost of first application process whose unix id is priorPid to true
+    end try
+  end if
+end tell
+end run`;
+  const result = await pi.exec("/usr/bin/osascript", ["-e", script, String(pid), text, appName, windowTitle], { signal, timeout });
+  const stderr = cleanCuaStderr(result.stderr?.trim() ?? "");
+  if (result.code !== 0) {
+    return { isError: true, content: [{ type: "text", text: stderr || result.stdout?.trim() || `Forced keystrokes failed with code ${result.code}.` }], details: { code: result.code, pid, characterCount: text.length, mode: "system-events-keystroke" } };
+  }
+  return { isError: false, content: [{ type: "text", text: `Typed ${text.length} character(s) as real keystrokes to pid ${pid}; restored prior app focus.` }], details: { code: result.code, pid, characterCount: text.length, mode: "system-events-keystroke" } };
+}
+
 function normalizeDriverParams(p: DriverInput): DriverInput {
   if (p.action === "get_window_state") return { ...p, action: "window_state" } as DriverInput;
   return p;
@@ -388,8 +493,16 @@ function maybePostProcessDriverResult(result: Awaited<ReturnType<typeof run>>, p
   if (!out) return result;
   if (params.action === "screenshot" && !result.isError) {
     const size = readableFileSize(out);
-    result.content = [{ type: "text", text: existsSync(out) ? `Saved window screenshot to ${out}${size ? ` (${size})` : ""}\n${stdout}`.trim() : `Screenshot command succeeded, but ${out} was not created. Raw output:\n${stdout}` }];
-    result.details = { ...result.details, screenshotOutFile: out, screenshotFileExists: existsSync(out) };
+    const dims = imageDimensions(out);
+    const coordinateNote = dims ? `, ${dims.width}×${dims.height} screenshot pixels. Pixel clicks use these coordinates exactly—do not Retina-scale or add window origin.` : "";
+    result.content = [{ type: "text", text: existsSync(out) ? `Saved window screenshot to ${out}${size ? ` (${size}` : ""}${size ? coordinateNote + ")" : coordinateNote}\n${stdout}`.trim() : `Screenshot command succeeded, but ${out} was not created. Raw output:\n${stdout}` }];
+    result.details = { ...result.details, screenshotOutFile: out, screenshotFileExists: existsSync(out), imageDimensions: dims };
+  }
+  if (params.action === "click" && params.debugImageOut && !result.isError && existsSync(params.debugImageOut)) {
+    const dims = imageDimensions(params.debugImageOut);
+    const size = readableFileSize(params.debugImageOut);
+    result.content = [{ type: "text", text: `${result.content?.[0]?.text ?? stdout}\nDebug click image: ${params.debugImageOut}${size ? ` (${size})` : ""}${dims ? `, ${dims.width}×${dims.height}` : ""}. The red crosshair is the exact coordinate received.`.trim() }];
+    result.details = { ...result.details, debugImageOut: params.debugImageOut, debugImageDimensions: dims };
   }
   if (params.action === "window_state" && !result.isError) {
     const size = readableFileSize(out);
@@ -421,7 +534,7 @@ export default function (pi: ExtensionAPI) {
   } as any);
   if (!integratedWorkflowTool) throw new Error("Cua integrated workflow failed to initialize.");
 
-  pi.registerTool({ name: "cua_driver", label: "Cua Driver", description: "Native macOS application control. Never use Cua for ordinary webpage reading or Chrome DOM interaction; use web_cli (or the web CLI through bash) first because it is faster and more reliable. For native apps, action=workflow provides cached background-window targeting, fuzzy semantic AX selectors, up to 30 sequential steps, pixels, drags, AppleScript, and raw calls. Direct actions remain available for screenshots, zoom, browser chrome, non-DOM visual fallbacks, and low-level control.", promptSnippet: "Native Mac app control only; use web_cli first for Chrome pages and reserve Cua for native or genuinely visual fallback work.", promptGuidelines: ["Do not use cua_driver for routine Chrome webpage reading, navigation, links, buttons, forms, or DOM interaction. Use web_cli first; Cua is only for native browser chrome, non-DOM visual content, or a genuine fallback after web_cli cannot perform the task.", "Use cua_driver action=workflow as the default for native Mac control; it combines target resolution, semantic inspection, actions, and verification in one fast call.", "For background control while the user keeps working, pass workflow.app and optionally workflow.windowTitle; avoid relying on the frontmost window.", "Use workflow.action=inspect for discovery, act for one operation, and sequence for up to 30 mixed semantic, keyboard, pixel, drag, AppleScript, or raw Cua steps.", "Use direct cua_driver actions for standalone screenshots, zoom, recording, cursor controls, and uncommon low-level operations. Use its page primitive only for non-Chrome native WebViews/debug targets or a confirmed web_cli failure—not as the normal Chrome path.", "For live Chrome pages, prefer web_cli or `web`; both default to the persistent Pi Automation window in the user's authenticated Chrome profile. Use `tab=active` only when explicitly requested. Sitegeist shares that same bot window and is only for canvas/SVG and difficult visual flows.", "If workflow cannot resolve a native element, use direct get_window_state with a query, then element_index or screenshot/pixel targeting.", "Keep output small: use query filters and screenshotOutFile for images."], parameters: driverSchema, async execute(_id, rawParams, signal, onUpdate, ctx) { try { const params0 = normalizeDriverParams(rawParams); if (params0.action === "workflow") { if (!params0.workflow) throw new Error("cua_driver action=workflow requires workflow parameters."); return await integratedWorkflowTool.execute(_id, params0.workflow, signal, onUpdate, ctx); } if (params0.action === "start") return await run(pi, "open", ["-n", "-g", "-a", "CuaDriver", "--args", "serve"], signal, params0.timeoutMs, onUpdate); if (!["status", "stop"].includes(params0.action) && params0.action !== "raw") await ensureCuaDriverDaemon(pi, signal); let params = params0; const pidMissing = params.pid === undefined || params.pid === null || params.pid === ""; if (pidMissing && PID_REQUIRED_ACTIONS.has(params.action) && !(params.action === "page" && params.pageAction === "enable_javascript_apple_events")) { params = await resolveDriverTarget(pi, params, signal, onUpdate); } const elementWindowActions = ["click", "double_click", "right_click", "type_text", "type_text_chars", "set_value", "press_key", "scroll"]; const canResolveWindow = params.pid !== undefined && (["window_state", "page", "screenshot"].includes(params.action) || (elementWindowActions.includes(params.action) && (params.elementIndex !== undefined || params.action === "set_value"))) && !(params.action === "page" && params.pageAction === "enable_javascript_apple_events"); if (canResolveWindow && params.windowId === undefined) return maybePostProcessDriverResult(await runDriverWithResolvedWindow(pi, params, signal, onUpdate), params); if (params.action === "screenshot" && params.windowId === undefined) return await runFullScreenScreenshot(pi, params, signal, onUpdate); const args = buildDriverArgs(params); const result = await run(pi, CUA_DRIVER_BIN, args, signal, params.timeoutMs, onUpdate); const stale = result.isError && /No window with window_id|window_id .*does not exist|must belong to pid/i.test(`${result.details?.stdout}\n${result.details?.stderr}`); if (stale && canResolveWindow) return maybePostProcessDriverResult(await runDriverWithResolvedWindow(pi, { ...params, windowId: undefined }, signal, onUpdate), params); return maybePostProcessDriverResult(result, params); } catch (e) { return { isError: true, content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }], details: { params: rawParams } }; } } });
+  pi.registerTool({ name: "cua_driver", label: "Cua Driver", description: "Speed-first native macOS application control. Never use Cua for ordinary webpage DOM work; use web_cli first. For native apps, action=workflow batches a whole flow from one shared AX observation, refreshes only at real transitions or misses, and skips routine verification. Use workflow.action=parallel to execute independent windows concurrently in one call, or program for a complete JXA/AppleScript flow. Supports background targeting, cached windows, unlabeled role-only controls, and compact performance telemetry.", promptSnippet: "Speed-first native Mac control: one-call batches, shared observations, concurrent independent windows, minimal verification.", promptGuidelines: ["Do not use cua_driver for routine Chrome webpage reading, navigation, links, buttons, forms, or DOM interaction. Use web_cli for Chrome DOM work and cua_driver workflow for native browser chrome or non-DOM native visuals.", "Use cua_driver action=workflow as the primary native Mac control path. Prefer one complete program or the largest safe sequence rather than inspect/click/inspect loops.", "For background control while the user keeps working, pass workflow.app and optionally workflow.windowTitle; avoid relying on the frontmost window.", "Use workflow.action=sequence with observationPolicy=fast by default: it reuses one AX observation, refreshes on readiness waits or selector misses, and returns compact telemetry.", "Use workflow.action=parallel with tasks for two or more independent app/windows so target resolution and action batches run concurrently inside one tool call. Never put the same window in two parallel tasks.", "When a native flow can be expressed reliably as code, use workflow action=program with JavaScript or AppleScript so the entire operation runs in one osascript process; inspect once first only when selectors truly must be discovered.", "Do not make a separate verification call after a successful workflow. Add workflow.verify only for consequential endpoints, genuine ambiguity, or explicit user requests.", "Avoid fixed sleeps. Add a readiness wait only at a real UI transition such as opening a sheet; stable fields and controls should execute from the shared observation without reinspection.", "For cua_driver pixel clicks, use x/y exactly from the full window screenshot PNG. Coordinates are window-local image pixels: do not divide for Retina, convert to screen points, or add the window origin. Set fromZoom=true only for coordinates taken from a zoom image, and use debugImageOut when confidence is low.", "Use cua_driver action=type_text for fast normal AX insertion. If a surface such as DevTools rejects or silently ignores AX insertion, use type_text_chars to force real System Events keystrokes; it briefly fronts the target app and restores the prior app.", "When web_cli cannot see page-owned framework expandos or component state, Chrome DevTools is a legitimate browser-chrome fallback: open its Console with Cua, focus the prompt, then use type_text_chars for reliable real typing.", "After opening DevTools or switching a GPU-heavy native view, wait roughly 300–700ms before screenshot capture; if a capture is mostly black or stale, retry once after a short wait instead of reasoning from it.", "Use direct cua_driver actions for standalone screenshots, zoom, recording, cursor controls, and uncommon low-level operations. Use its page primitive only for non-Chrome native WebViews/debug targets or a confirmed web_cli failure—not as the normal Chrome path.", "For live Chrome pages, prefer web_cli or `web`; both default to the persistent Pi Automation window in the user's authenticated Chrome profile. Use `tab=active` only when explicitly requested. Sitegeist shares that same bot window and is only for canvas/SVG and difficult visual flows.", "For unlabeled native fields or buttons, stay in cua_driver workflow and select by role plus occurrence with query omitted; do not switch to screenshot or pixel control.", "Keep responseMode=compact for normal work; request detailed output or screenshots only when debugging."], parameters: driverSchema, async execute(_id, rawParams, signal, onUpdate, ctx) { try { const params0 = normalizeDriverParams(rawParams); if (params0.action === "workflow") { if (!params0.workflow) throw new Error("cua_driver action=workflow requires workflow parameters."); return await integratedWorkflowTool.execute(_id, params0.workflow, signal, onUpdate, ctx); } if (params0.action === "start") return await run(pi, "open", ["-n", "-g", "-a", "CuaDriver", "--args", "serve"], signal, params0.timeoutMs, onUpdate); if (!["status", "stop"].includes(params0.action) && params0.action !== "raw") await ensureCuaDriverDaemon(pi, signal); let params = params0; const pidMissing = params.pid === undefined || params.pid === null || params.pid === ""; if (pidMissing && PID_REQUIRED_ACTIONS.has(params.action) && !(params.action === "page" && params.pageAction === "enable_javascript_apple_events")) { params = await resolveDriverTarget(pi, params, signal, onUpdate); } if (params.action === "type_text_chars") return await runForcedKeystrokes(pi, params, signal, onUpdate); const elementWindowActions = ["click", "double_click", "right_click", "type_text", "set_value", "press_key", "scroll"]; const canResolveWindow = params.pid !== undefined && (["window_state", "page", "screenshot"].includes(params.action) || (elementWindowActions.includes(params.action) && (params.elementIndex !== undefined || params.action === "set_value"))) && !(params.action === "page" && params.pageAction === "enable_javascript_apple_events"); if (canResolveWindow && params.windowId === undefined) return maybePostProcessDriverResult(await runDriverWithResolvedWindow(pi, params, signal, onUpdate), params); if (params.action === "screenshot" && params.windowId === undefined) return await runFullScreenScreenshot(pi, params, signal, onUpdate); const args = buildDriverArgs(params); const result = await run(pi, CUA_DRIVER_BIN, args, signal, params.timeoutMs, onUpdate); const stale = result.isError && /No window with window_id|window_id .*does not exist|must belong to pid/i.test(`${result.details?.stdout}\n${result.details?.stderr}`); if (stale && canResolveWindow) return maybePostProcessDriverResult(await runDriverWithResolvedWindow(pi, { ...params, windowId: undefined }, signal, onUpdate), params); return maybePostProcessDriverResult(result, params); } catch (e) { return { isError: true, content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }], details: { params: rawParams } }; } } });
 
 
 }

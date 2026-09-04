@@ -5,7 +5,7 @@ Two [Pi](https://pi.dev) coding-agent extensions, packaged together so a single 
 | Tool | Extension | What it does |
 |------|-----------|--------------|
 | `cua_driver` | `extensions/cua-tool` | Drive native macOS apps (Xcode, Finder, System Settings, Blender, …) via the CuaDriver daemon — screenshots, clicks, typing, semantic AX selectors, 30-step workflows, AppleScript. **macOS only.** |
-| `web_cli`   | `extensions/web-cli` | Fast DOM control of your live authenticated Chrome (macOS) via a bundled AppleScript + cua-driver shim — navigate, read text, find/click/fill buttons & inputs, run JS, manage tabs, chain 30-step sequences. |
+| `web_cli`   | `extensions/web-cli` | Fast DOM control of your live authenticated Chrome (macOS) through a cached CuaDriver page channel, with AppleScript reserved for setup and exact-tab fallbacks — navigate, read, click, fill, run JS, manage tabs, and chain 30-step sequences. |
 
 Both register as LLM-callable tools inside Pi, so once installed the model can use them directly.
 
@@ -83,7 +83,7 @@ export CUA_DRIVER_BIN=/path/to/cua-driver
 
 ### web_cli → the `web` Chrome shim (bundled in this repo)
 
-`web_cli` does **not** use the cross-platform `agent-browser` npm CLI — it calls a custom bash shim that controls your live Chrome via AppleScript + CuaDriver page tools. That shim is shipped in this repo at `scripts/web`, so you don't have to fetch it separately.
+`web_cli` does **not** use the cross-platform `agent-browser` npm CLI. It calls a custom bash shim that keeps a dedicated **Pi Automation** Chrome window and caches that window's exact Chrome tab ID plus native PID/window ID. Warm session DOM commands go directly through the persistent CuaDriver page daemon; AppleScript is used only for bootstrap/repair, explicit non-session tabs, and trusted foreground input. The shim is shipped at `scripts/web`.
 
 Install it onto your `PATH`:
 
@@ -105,9 +105,11 @@ The extension looks for `~/.local/bin/web` first, then falls back to `web` on `P
 export WEB_CLI_PATH=/path/to/web
 ```
 
-Requirements for the shim: **macOS**, **Google Chrome** installed, and **CuaDriver.app** present (the shim uses `cua-driver call page ...` for JS execution and text extraction). Grant Chrome the same Accessibility permissions you gave CuaDriver.
+Requirements for the shim: **macOS**, **Google Chrome** installed, and **CuaDriver.app** present (the shim uses `cua-driver call page ...` for JavaScript execution and text extraction). Grant Chrome the same Accessibility permissions you gave CuaDriver.
 
-You also need a Chrome logged into the account you want the agent to use. `web_cli` targets a persistent named "Pi Automation" window in your existing Chrome profile — it does **not** open a separate headless browser and does **not** take over your active tab.
+You also need Chrome logged into the account you want the agent to use. `web_cli` targets a persistent named **Pi Automation** window in your existing Chrome profile—it does **not** open a separate headless browser or adopt your active tab. Normal DOM operations remain background-safe while you use another Chrome window. Trusted clicks, real typing, and browser-gated controls may briefly foreground the exact automation tab, then restore the previous app/window/tab.
+
+On the development machine, caching the dedicated session target reduced warm `run`/`summary` command latency from roughly **618–645 ms to about 217 ms** (approximately **2.9–3× faster**). Cold start, target repair, page loading, and trusted input are not included in that microbenchmark.
 
 ---
 

@@ -26,6 +26,38 @@ SESSION_TAB_ID=""
 SESSION_TITLE=""
 SESSION_URL=""
 SESSION_BOUNDS=""
+CACHE_SESSION_WINDOW_ID=""
+CACHE_SESSION_TAB_ID=""
+FAST_SESSION_TARGET=0
+SESSION_LOCK_DIR="${WEB_SESSION_FILE}.lock"
+SESSION_LOCK_HELD=0
+
+release_session_lock() {
+    if [[ "$SESSION_LOCK_HELD" == "1" ]]; then
+        rm -rf "$SESSION_LOCK_DIR" 2>/dev/null || true
+        SESSION_LOCK_HELD=0
+    fi
+}
+
+acquire_session_lock() {
+    local deadline=$((SECONDS + ${WEB_LOCK_TIMEOUT_SECONDS:-20})) owner=""
+    mkdir -p "$(dirname "$WEB_SESSION_FILE")"
+    while ! mkdir "$SESSION_LOCK_DIR" 2>/dev/null; do
+        if [[ -f "$SESSION_LOCK_DIR/pid" ]]; then owner=$(<"$SESSION_LOCK_DIR/pid"); else owner=""; fi
+        if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -rf "$SESSION_LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+        if (( SECONDS >= deadline )); then
+            echo "Error: timed out waiting for Chrome automation lock: $SESSION_LOCK_DIR" >&2
+            return 1
+        fi
+        sleep 0.05
+    done
+    printf '%s\n' "$$" > "$SESSION_LOCK_DIR/pid"
+    SESSION_LOCK_HELD=1
+    trap release_session_lock EXIT INT TERM HUP
+}
 
 json_quote() {
     # Pure-bash JSON quoting — avoids ~70ms python3 startup per call
@@ -107,6 +139,17 @@ on run argv
       end repeat
     end if
     if targetTab is missing value then set targetTab to active tab of targetWindow
+    -- cua-driver's page primitive addresses the active tab of an exact native
+    -- window. Keep the remembered bot tab active inside the dedicated bot
+    -- window without raising that window or changing the user's foreground.
+    set tabIndex to 0
+    repeat with candidate in tabs of targetWindow
+      set tabIndex to tabIndex + 1
+      if (id of candidate as text) is (id of targetTab as text) then
+        set active tab index of targetWindow to tabIndex
+        exit repeat
+      end if
+    end repeat
     set b to bounds of targetWindow
     return (id of targetWindow as text) & d & (id of targetTab as text) & d & (item 1 of b as text) & d & (item 2 of b as text) & d & (item 3 of b as text) & d & (item 4 of b as text) & d & (title of targetTab as text) & d & (URL of targetTab as text)
   end tell
@@ -225,16 +268,20 @@ APPLESCRIPT
 
 load_cache() {
     if [[ -f "$WEB_CACHE" ]]; then
+        # This file is generated only by this script and contains numeric IDs.
         # shellcheck disable=SC1090
         source "$WEB_CACHE" 2>/dev/null || true
         PID="${PID:-${WEB_PID:-}}"
         WID="${WID:-${WEB_WID:-}}"
+        CACHE_SESSION_WINDOW_ID="${WEB_CHROME_WINDOW_ID:-}"
+        CACHE_SESSION_TAB_ID="${WEB_CHROME_TAB_ID:-}"
     fi
 }
 
 write_cache_line() {
-    local pid="$1" wid="$2"
-    printf 'WEB_PID=%s; export WEB_PID; WEB_WID=%s; export WEB_WID\n' "$pid" "$wid"
+    local pid="$1" wid="$2" chrome_window_id="${3:-}" chrome_tab_id="${4:-}"
+    printf 'WEB_PID=%s; export WEB_PID; WEB_WID=%s; export WEB_WID; WEB_CHROME_WINDOW_ID=%s; export WEB_CHROME_WINDOW_ID; WEB_CHROME_TAB_ID=%s; export WEB_CHROME_TAB_ID\n' \
+        "$pid" "$wid" "$chrome_window_id" "$chrome_tab_id"
 }
 
 # Load cached target immediately, but CLI --pid/--wid can override below.
@@ -254,38 +301,85 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${POSITIONAL[@]}"
 
-cmd_auto() {
-    # Legacy Cua page binding, now made safe: it resolves only the named bot
-    # window instead of caching whichever user Chrome window is visually first.
-    ensure_session
+cache_native_session_target() {
+    # Resolve only the dedicated Pi Automation window. This is the slow repair /
+    # bootstrap path; normal page commands reuse the resulting native pid/window
+    # IDs and go straight through the persistent cua-driver daemon.
     local result
-    result=$(cua-driver call list_windows '{"on_screen_only":false}' --compact 2>&1)
+    result=$(cua-driver call list_windows '{"on_screen_only":false}' --compact 2>&1) || {
+        printf '%s\n' "$result" >&2
+        return 1
+    }
     printf '%s' "$result" | python3 -c '
 import json, sys
-cache, bounds = sys.argv[1], sys.argv[2]
+cache, bounds, chrome_window_id, chrome_tab_id = sys.argv[1:5]
 x, y, width, height = map(int, bounds.split(","))
 try:
     data = json.load(sys.stdin)
     wins = [w for w in data.get("windows", []) if w.get("app_name") == "Google Chrome"]
     named = [w for w in wins if w.get("title") == "Pi Automation"]
-    matched = named or [w for w in wins if w.get("bounds") == {"x":x,"y":y,"width":width,"height":height}]
+    bounded = [w for w in wins if all(abs(int((w.get("bounds") or {}).get(k, -99999)) - v) <= 3 for k, v in (("x",x),("y",y),("width",width),("height",height)))]
+    matched = named or bounded
     if not matched:
         raise SystemExit(1)
+    matched.sort(key=lambda w: (bool(w.get("is_on_screen")), w.get("on_current_space") is not False, w.get("z_index", -9999)), reverse=True)
     w = matched[0]
-    line = "WEB_PID={}; export WEB_PID; WEB_WID={}; export WEB_WID".format(w["pid"], w["window_id"])
+    line = "WEB_PID={}; export WEB_PID; WEB_WID={}; export WEB_WID; WEB_CHROME_WINDOW_ID={}; export WEB_CHROME_WINDOW_ID; WEB_CHROME_TAB_ID={}; export WEB_CHROME_TAB_ID".format(w["pid"], w["window_id"], chrome_window_id, chrome_tab_id)
     print(line)
     with open(cache, "w") as f:
         f.write(line + "\n")
 except Exception:
     raise SystemExit(1)
-' "$WEB_CACHE" "$SESSION_BOUNDS"
+' "$WEB_CACHE" "$SESSION_BOUNDS" "$SESSION_WINDOW_ID" "$SESSION_TAB_ID"
+}
+
+try_cached_session_target() {
+    load_session
+    load_cache
+    if [[ "$SESSION_WINDOW_ID" =~ ^[0-9]+$ && "$SESSION_TAB_ID" =~ ^[0-9]+$ &&
+          "$PID" =~ ^[0-9]+$ && "$WID" =~ ^[0-9]+$ &&
+          "$CACHE_SESSION_WINDOW_ID" == "$SESSION_WINDOW_ID" &&
+          "$CACHE_SESSION_TAB_ID" == "$SESSION_TAB_ID" ]]; then
+        FAST_SESSION_TARGET=1
+        TAB_TARGET=""
+        return 0
+    fi
+    return 1
+}
+
+refresh_fast_session_target() {
+    ensure_session || return 1
+    cache_native_session_target >/dev/null || return 1
+    PID=""
+    WID=""
+    CACHE_SESSION_WINDOW_ID=""
+    CACHE_SESSION_TAB_ID=""
+    unset WEB_PID WEB_WID WEB_CHROME_WINDOW_ID WEB_CHROME_TAB_ID 2>/dev/null || true
+    load_cache
+    if [[ "$PID" =~ ^[0-9]+$ && "$WID" =~ ^[0-9]+$ &&
+          "$CACHE_SESSION_WINDOW_ID" == "$SESSION_WINDOW_ID" &&
+          "$CACHE_SESSION_TAB_ID" == "$SESSION_TAB_ID" ]]; then
+        FAST_SESSION_TARGET=1
+        TAB_TARGET=""
+        return 0
+    fi
+    return 1
+}
+
+cmd_auto() {
+    ensure_session
+    cache_native_session_target
 }
 
 ensure_target() {
     # No --tab means the persistent Pi Automation tab—not whichever Chrome
-    # window happens to be frontmost this turn. "active" remains available as
-    # an explicit opt-in when the user actually wants their current tab used.
+    # window happens to be frontmost this turn. Reuse its exact cached native
+    # window through cua-driver; only bootstrap/repair pays the AppleScript tab
+    # discovery cost. "active" remains an explicit opt-in to the user's tab.
     if [[ -z "$TAB_TARGET" || "$TAB_TARGET" == "session" || "$TAB_TARGET" == "bot" ]]; then
+        if try_cached_session_target; then return 0; fi
+        if refresh_fast_session_target; then return 0; fi
+        # Safe fallback: exact-tab Apple Events, never the user's front window.
         ensure_session
         TAB_TARGET="tab:$SESSION_TAB_ID"
         return 0
@@ -383,6 +477,15 @@ end run
 APPLESCRIPT
 }
 
+unwrap_cua_page_result() {
+    local text="$1" open_fence=$'```\n' close_fence=$'\n```'
+    if [[ "$text" == "## Result"$'\n\n'* && "$text" == *"$close_fence" ]]; then
+        text="${text#*"$open_fence"}"
+        text="${text%"$close_fence"}"
+    fi
+    printf '%s' "$text"
+}
+
 run_js() {
     local js="$1" quoted_js payload out i
     if [[ -n "$TAB_TARGET" ]]; then
@@ -404,31 +507,48 @@ run_js() {
         fi
         return 1
     fi
-    quoted_js=$(json_quote "$js")
-    payload=$(printf '{"pid":%s,"window_id":%s,"action":"execute_javascript","javascript":%s}\n' "$PID" "$WID" "$quoted_js")
-    # AppleScript `do JavaScript` returns "missing value" when the JS stalls / times
-    # out (common with slow synchronous XMLHttpRequest) or returns undefined. That
-    # is a transient timing failure, not a real error — retry a few times before
-    # giving up so callers don't see silent "missing value" flakiness.
-    local retries="${WEB_RUN_RETRIES:-3}"
+
+    # Fast path: the dedicated automation window is already bound to the
+    # long-running cua-driver daemon. This avoids an osascript process and a
+    # full Chrome window/tab scan for every DOM command.
+    local retries="${WEB_RUN_RETRIES:-3}" rc=0 repaired=0
     i=0
     while (( i < retries )); do
-        out=$(printf '%s' "$payload" | cua-driver call page --compact 2>&1) || true
-        if ! printf '%s' "$out" | grep -q 'missing value'; then
-            printf '%s' "$out"
+        quoted_js=$(json_quote "$js")
+        payload=$(printf '{"pid":%s,"window_id":%s,"action":"execute_javascript","javascript":%s}\n' "$PID" "$WID" "$quoted_js")
+        if out=$(printf '%s' "$payload" | cua-driver call page --compact 2>&1); then rc=0; else rc=$?; fi
+
+        if (( rc != 0 && FAST_SESSION_TARGET == 1 && repaired == 0 )) &&
+           printf '%s' "$out" | grep -Eqi 'No window|window_id|does not exist|connection refused|daemon|target.*not found'; then
+            repaired=1
+            if refresh_fast_session_target; then continue; fi
+        fi
+
+        if (( rc == 0 )) && ! printf '%s' "$out" | grep -q 'missing value'; then
+            unwrap_cua_page_result "$out"
             return 0
         fi
         (( i++ )) || true
-        sleep 0.4
+        sleep 0.15
     done
-    # All retries returned "missing value" — surface a clear error instead of the
-    # opaque literal so the caller knows to fetch less data or raise the timeout.
-    printf 'web run: JS returned "missing value" after %s attempt(s) — likely a timeout (slow sync XHR?) or the JS returned undefined. Wrap JS in an IIFE that returns a serializable value, or fetch less per call.\n' "$retries" >&2
-    printf '%s' "$out"
+
+    if printf '%s' "$out" | grep -q 'missing value'; then
+        printf 'web run: JS returned "missing value" after %s attempt(s) — likely a timeout or undefined result. Return a serializable value or fetch less per call.\n' "$retries" >&2
+    else
+        printf '%s\n' "$out" >&2
+    fi
     return 1
 }
 
 # --- Page commands ---
+
+run_action_js() {
+    local out rc=0
+    if out=$(run_js "$1" 2>&1); then rc=0; else rc=$?; fi
+    printf '%s\n' "$out"
+    (( rc == 0 )) || return "$rc"
+    if printf '%s' "$out" | grep -Eq '(^|[,{])[[:space:]]*"error"[[:space:]]*:'; then return 1; fi
+}
 
 cmd_nav() {
     local url="${1:?Usage: web nav <url>}"
@@ -464,7 +584,7 @@ cmd_find_text() {
     local text_q selector_q
     text_q=$(json_quote "${1:?Usage: web find-text <text>}")
     selector_q=$(json_quote "${2:-a,button,input,select,textarea,[role],label,[onclick]}")
-    run_js "(()=>{const needle=$text_q;const selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||'');return JSON.stringify(Array.from(document.querySelectorAll(selector)).filter(e=>visible(e)&&txt(e).toLowerCase().includes(needle.toLowerCase())).map((e,i)=>({i,tag:e.tagName,text:txt(e).trim().slice(0,100),href:e.href||'',id:e.id||'',cls:(e.className||'').toString().slice(0,80),type:e.type||'',name:e.name||'',placeholder:e.placeholder||''})))})()"
+    run_js "(()=>{const needle=$text_q;const selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||'');const norm=s=>String(s||'').replace(/\\s+/g,' ').trim().toLowerCase();const q=norm(needle);const interactive=e=>/^(A|BUTTON|INPUT|SELECT|TEXTAREA|MAT-OPTION)$/.test(e.tagName)||['button','option','menuitem','radio','checkbox','link','tab'].includes(e.getAttribute('role'));const depth=e=>{let d=0;for(let n=e;n;n=n.parentElement)d++;return d};const rows=Array.from(document.querySelectorAll(selector)).filter(e=>visible(e)&&norm(txt(e)).includes(q)).map((e,order)=>{const n=norm(txt(e));const score=(n===q?100000:n.startsWith(q)?50000:10000)+(interactive(e)?2000:0)+depth(e)*5-Math.min(n.length,1000);return{e,order,score}}).sort((a,b)=>b.score-a.score||a.order-b.order).map(({e},i)=>({i,tag:e.tagName,text:txt(e).trim().slice(0,100),href:e.href||'',id:e.id||'',cls:(e.className||'').toString().slice(0,80),type:e.type||'',name:e.name||'',placeholder:e.placeholder||''}));return JSON.stringify(rows)})()"
 }
 
 cmd_find_links() {
@@ -486,34 +606,48 @@ cmd_find_inputs() {
 cmd_click() {
     local selector_q
     selector_q=$(json_quote "${1:?Usage: web click <selector>}")
-    run_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});e.scrollIntoView({block:'center',inline:'center'});e.click();return JSON.stringify({clicked:true,tag:e.tagName,text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim().slice(0,80)})})()"
+    run_action_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});if(e.disabled||e.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',selector});e.scrollIntoView({block:'center',inline:'center'});e.focus({preventScroll:true});e.click();return JSON.stringify({clicked:true,synthetic:true,tag:e.tagName,text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim().slice(0,80)})})()"
 }
 
 cmd_click_text() {
     local text_q selector_q
     text_q=$(json_quote "${1:?Usage: web click-text <text>}")
     selector_q=$(json_quote "${2:-a,button,input,select,textarea,[role],label,[onclick]}")
-    run_js "(()=>{const needle=$text_q;const selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||'');const found=Array.from(document.querySelectorAll(selector)).find(e=>visible(e)&&txt(e).toLowerCase().includes(needle.toLowerCase()));if(!found)return JSON.stringify({error:'No element found with text',text:needle});found.scrollIntoView({block:'center',inline:'center'});found.click();return JSON.stringify({clicked:true,tag:found.tagName,text:txt(found).trim().slice(0,80),href:found.href||''})})()"
+    run_action_js "(()=>{const needle=$text_q;const selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||'');const norm=s=>String(s||'').replace(/\\s+/g,' ').trim().toLowerCase();const q=norm(needle);const interactive=e=>/^(A|BUTTON|INPUT|SELECT|TEXTAREA|MAT-OPTION)$/.test(e.tagName)||['button','option','menuitem','radio','checkbox','link','tab'].includes(e.getAttribute('role'));const depth=e=>{let d=0;for(let n=e;n;n=n.parentElement)d++;return d};const candidates=Array.from(document.querySelectorAll(selector)).filter(e=>visible(e)&&norm(txt(e)).includes(q)).map((e,order)=>{const n=norm(txt(e));return{e,order,score:(n===q?100000:n.startsWith(q)?50000:10000)+(interactive(e)?2000:0)+depth(e)*5-Math.min(n.length,1000)}}).sort((a,b)=>b.score-a.score||a.order-b.order);const found=candidates[0]?.e;if(!found)return JSON.stringify({error:'No element found with text',text:needle});if(found.disabled||found.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',text:needle,tag:found.tagName});found.scrollIntoView({block:'center',inline:'center'});found.focus({preventScroll:true});found.click();return JSON.stringify({clicked:true,synthetic:true,tag:found.tagName,text:txt(found).trim().slice(0,80),href:found.href||'',exact:Math.abs((candidates[0]?.score||0))>=100000})})()"
+}
+
+run_main_js() {
+    local source="${1:?Usage: web run-main <js>}" source_q
+    source_q=$(json_quote "$source")
+    run_action_js "(()=>{const source=$source_q;const id='__web_main_'+Date.now()+'_'+Math.random().toString(36).slice(2);const carrier=document.createElement('div');carrier.id=id;carrier.hidden=true;document.documentElement.appendChild(carrier);const script=document.createElement('script');script.textContent='(()=>{const carrier=document.getElementById('+JSON.stringify(id)+');try{const value=(0,eval)('+JSON.stringify(source)+');if(value===undefined)carrier.textContent=JSON.stringify({mainWorld:true,value:null});else if(typeof value===\"string\")carrier.textContent=value;else carrier.textContent=JSON.stringify(value);}catch(e){carrier.textContent=JSON.stringify({error:\"Main-world JavaScript failed\",message:String(e&&e.message||e),stack:String(e&&e.stack||\"\").slice(0,1000)});}})()';(document.head||document.documentElement).appendChild(script);script.remove();const out=carrier.textContent;carrier.remove();return out||JSON.stringify({error:'Main-world script did not execute; the page Content Security Policy may block inline injection.'})})()"
 }
 
 cmd_fill() {
-    local selector_q value_q
+    local selector_q value_q main_source main_out
     selector_q=$(json_quote "${1:?Usage: web fill <selector> <value>}")
     value_q=$(json_quote "${2:?Usage: web fill <selector> <value>}")
-    run_js "(()=>{const selector=$selector_q;const value=$value_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});e.scrollIntoView({block:'center',inline:'center'});e.focus();if(e.tagName.toLowerCase()==='select'){e.value=value;e.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({filled:true,tag:'SELECT',value:e.value})}const proto=Object.getPrototypeOf(e);const desc=Object.getOwnPropertyDescriptor(proto,'value');if(desc&&desc.set)desc.set.call(e,value);else e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({filled:true,tag:e.tagName,value:(e.value||'').slice(0,100)})})()"
+    main_source="(()=>{const selector=$selector_q;const value=$value_q;const e=document.querySelector(selector);if(!e)return {error:'Element not found',selector};if(e.disabled||e.getAttribute('aria-disabled')==='true')return {error:'Element is disabled',selector};e.scrollIntoView({block:'center',inline:'center'});e.focus({preventScroll:true});const jq=window.jQuery;const wrapper=e.closest&&e.closest('.custom-combobox');const linked=wrapper&&wrapper.previousElementSibling;if(jq&&linked&&linked.tagName==='SELECT'&&typeof jq(linked).combobox==='function'){if(!Array.from(linked.options).some(o=>o.value===value||o.text===value))linked.add(new Option(value,value));linked.value=value;jq(linked).combobox('setValueChange',value);e.blur();return {filled:true,tag:e.tagName,value:e.value,framework:'jquery-ui-combobox',mainWorld:true}}if(e.tagName.toLowerCase()==='select'){e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();return {filled:true,tag:'SELECT',value:e.value,mainWorld:true}}let proto=e,desc;while(proto&&!desc){proto=Object.getPrototypeOf(proto);if(proto)desc=Object.getOwnPropertyDescriptor(proto,'value')}if(desc&&desc.set)desc.set.call(e,value);else e.value=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));e.blur();return {filled:true,tag:e.tagName,value:(e.value||'').slice(0,100),mainWorld:true}})()"
+    # Prefer the page's own JavaScript world so jQuery/React/Vue-owned state is
+    # updated without bringing Chrome forward. Strict CSP pages fall back to the
+    # older isolated-world setter below.
+    if main_out=$(run_main_js "$main_source" 2>/dev/null); then
+        printf '%s\n' "$main_out"
+        return 0
+    fi
+    run_action_js "(()=>{const selector=$selector_q;const value=$value_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});if(e.disabled||e.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',selector});e.scrollIntoView({block:'center',inline:'center'});e.focus();if(e.tagName.toLowerCase()==='select'){e.value=value;e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({filled:true,tag:'SELECT',value:e.value,fallback:'isolated-world'})}let proto=e,desc;while(proto&&!desc){proto=Object.getPrototypeOf(proto);if(proto)desc=Object.getOwnPropertyDescriptor(proto,'value')}if(desc&&desc.set)desc.set.call(e,value);else e.value=value;e.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));e.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({filled:true,tag:e.tagName,value:(e.value||'').slice(0,100),fallback:'isolated-world'})})()"
 }
 
 cmd_select() {
     local selector_q option_q
     selector_q=$(json_quote "${1:?Usage: web select <selector> <option-text>}")
     option_q=$(json_quote "${2:?Usage: web select <selector> <option-text>}")
-    run_js "(()=>{const selector=$selector_q;const needle=$option_q;const s=document.querySelector(selector);if(!s||s.tagName!=='SELECT')return JSON.stringify({error:'Select not found',selector});const opt=Array.from(s.options).find(o=>o.text.toLowerCase().includes(needle.toLowerCase())||o.value.toLowerCase()===needle.toLowerCase());if(!opt)return JSON.stringify({error:'Option not found',option:needle});s.value=opt.value;s.dispatchEvent(new Event('input',{bubbles:true}));s.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({selected:true,value:opt.value,text:opt.text})})()"
+    run_action_js "(()=>{const selector=$selector_q;const needle=$option_q;const s=document.querySelector(selector);if(!s||s.tagName!=='SELECT')return JSON.stringify({error:'Select not found',selector});const q=needle.toLowerCase();const opts=Array.from(s.options);const opt=opts.find(o=>o.text.trim().toLowerCase()===q||o.value.toLowerCase()===q)||opts.find(o=>o.text.toLowerCase().includes(q));if(!opt)return JSON.stringify({error:'Option not found',option:needle});s.value=opt.value;s.dispatchEvent(new Event('input',{bubbles:true}));s.dispatchEvent(new Event('change',{bubbles:true}));return JSON.stringify({selected:true,value:opt.value,text:opt.text})})()"
 }
 
 cmd_submit() {
     local selector_q
     selector_q=$(json_quote "${1:?Usage: web submit <form-selector>}")
-    run_js "(()=>{const selector=$selector_q;const f=document.querySelector(selector);if(!f)return JSON.stringify({error:'Form not found',selector});const ev=new Event('submit',{bubbles:true,cancelable:true});const notCancelled=f.dispatchEvent(ev);if(notCancelled){if(typeof f.requestSubmit==='function')f.requestSubmit();else f.submit()}return JSON.stringify({submitted:true,cancelled:!notCancelled})})()"
+    run_action_js "(()=>{const selector=$selector_q;const f=document.querySelector(selector);if(!f)return JSON.stringify({error:'Form not found',selector});if(typeof f.requestSubmit==='function')f.requestSubmit();else f.submit();return JSON.stringify({submitted:true})})()"
 }
 
 cmd_scroll() {
@@ -527,17 +661,21 @@ cmd_run() {
     run_js "$*"
 }
 
+cmd_run_main() {
+    [[ $# -gt 0 ]] || { echo "Usage: web run-main <js>" >&2; exit 1; }
+    run_main_js "$*"
+}
+
 cmd_wait() {
     local ms="${1:?Usage: web wait <milliseconds>}"
     [[ "$ms" =~ ^[0-9]+$ ]] || { echo "Error: milliseconds must be an integer" >&2; exit 1; }
     local step=500 elapsed=0 result
-    # First check — return immediately if already loaded
+    # Readiness wait: return immediately when readyState is already complete.
     result=$(run_js "JSON.stringify({ready:document.readyState==='complete',state:document.readyState,url:location.href,title:document.title,ms:0})")
     if printf '%s' "$result" | grep -q '"ready":true'; then
         printf '%s\n' "$result"
         return 0
     fi
-    # Poll in 500ms increments, stop as soon as page is ready or budget expires
     while (( elapsed < ms )); do
         sleep 0.5 2>/dev/null || sleep 1
         (( elapsed += step )) || true
@@ -548,6 +686,14 @@ cmd_wait() {
         fi
     done
     printf '%s\n' "$result"
+}
+
+cmd_sleep() {
+    local ms="${1:?Usage: web sleep <milliseconds>}"
+    [[ "$ms" =~ ^[0-9]+$ ]] || { echo "Error: milliseconds must be an integer" >&2; exit 1; }
+    local seconds=$((ms / 1000)) millis=$((ms % 1000))
+    sleep "${seconds}.$(printf '%03d' "$millis")"
+    run_js "JSON.stringify({slept:$ms,state:document.readyState,url:location.href,title:document.title})"
 }
 
 cmd_cart() {
@@ -563,7 +709,190 @@ cmd_exists() {
 cmd_value() {
     local selector_q
     selector_q=$(json_quote "${1:?Usage: web value <selector>}")
-    run_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});return JSON.stringify({tag:e.tagName,value:e.value||'',text:(e.innerText||'').trim().slice(0,300),checked:!!e.checked,selected:e.selectedIndex})})()"
+    run_action_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});return JSON.stringify({tag:e.tagName,value:e.value||'',text:(e.innerText||'').trim().slice(0,300),checked:!!e.checked,selected:e.selectedIndex})})()"
+}
+
+NATIVE_PID=""
+NATIVE_WID=""
+prepare_exact_chrome_target() {
+    local record
+    record=$(resolve_target_record "$TAB_TARGET") || return 1
+    parse_session_record "$record"
+}
+
+resolve_native_chrome_window() {
+    local driver_json native_record bot_window_id="" prefer_named="false"
+    if [[ -f "$WEB_SESSION_FILE" ]]; then
+        bot_window_id=$(awk -F= '$1=="CHROME_WINDOW_ID"{print $2; exit}' "$WEB_SESSION_FILE" 2>/dev/null || true)
+    fi
+    [[ -n "$bot_window_id" && "$SESSION_WINDOW_ID" == "$bot_window_id" ]] && prefer_named="true"
+    driver_json=$(cua-driver call list_windows '{"on_screen_only":false}' --compact 2>&1) || {
+        printf '%s\n' "$driver_json" >&2
+        return 1
+    }
+    native_record=$(printf '%s' "$driver_json" | python3 -c '
+import json, sys
+name, bounds, prefer_named, target_title = sys.argv[1], sys.argv[2], sys.argv[3] == "true", sys.argv[4]
+x, y, width, height = map(int, bounds.split(","))
+data = json.load(sys.stdin)
+wins = [w for w in data.get("windows", []) if w.get("app_name") == "Google Chrome" and w.get("pid") and w.get("window_id")]
+def same_bounds(w):
+    b = w.get("bounds") or {}
+    return all(abs(int(b.get(k, -99999)) - v) <= 3 for k, v in (("x",x),("y",y),("width",width),("height",height)))
+named = [w for w in wins if w.get("title") == name]
+bounded = [w for w in wins if same_bounds(w)]
+exact_title = [w for w in wins if w.get("title") == target_title]
+if prefer_named:
+    matched = named or bounded
+else:
+    matched = [w for w in exact_title if same_bounds(w)] or exact_title or bounded
+if not matched: raise SystemExit(1)
+matched.sort(key=lambda w: (bool(w.get("is_on_screen")), w.get("on_current_space") is not False, w.get("z_index", -9999)), reverse=True)
+w = matched[0]
+print("{}\t{}".format(w["pid"], w["window_id"]))
+' "$WEB_SESSION_NAME" "$SESSION_BOUNDS" "$prefer_named" "$SESSION_TITLE") || return 1
+    IFS=$'\t' read -r NATIVE_PID NATIVE_WID <<< "$native_record"
+    [[ "$NATIVE_PID" =~ ^[0-9]+$ && "$NATIVE_WID" =~ ^[0-9]+$ ]]
+}
+
+activate_exact_chrome_tab() {
+    osascript - "$SESSION_WINDOW_ID" "$SESSION_TAB_ID" <<'APPLESCRIPT' >/dev/null
+on run argv
+  set wantedWindow to item 1 of argv
+  set wantedTab to item 2 of argv
+  tell application "Google Chrome"
+    repeat with w in windows
+      if (id of w as text) is wantedWindow then
+        set tabIndex to 0
+        repeat with t in tabs of w
+          set tabIndex to tabIndex + 1
+          if (id of t as text) is wantedTab then set active tab index of w to tabIndex
+        end repeat
+        set index of w to 1
+      end if
+    end repeat
+    activate
+  end tell
+end run
+APPLESCRIPT
+}
+
+trusted_click_from_js() {
+    local geometry_js="$1" geometry parsed x y label payload result rc=0
+    geometry=$(run_js "$geometry_js") || return 1
+    if ! parsed=$(printf '%s' "$geometry" | python3 -c '
+import json, sys
+j=json.load(sys.stdin)
+if j.get("error"): raise SystemExit(j["error"])
+print("{}\t{}\t{}".format(round(float(j["x"])), round(float(j["y"])), str(j.get("text", "")).replace(chr(9), " ")[:120]))
+'); then
+        printf '%s\n' "$geometry" >&2
+        return 1
+    fi
+    IFS=$'\t' read -r x y label <<< "$parsed"
+    [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ ]] || { echo "Error: invalid trusted-click coordinates." >&2; return 1; }
+    prepare_exact_chrome_target || return 1
+    capture_ui_context
+    activate_exact_chrome_tab
+    sleep 0.2
+    if ! resolve_native_chrome_window; then restore_ui_context; return 1; fi
+    payload=$(printf '{"pid":%s,"window_id":%s,"x":%s,"y":%s,"count":1}' "$NATIVE_PID" "$NATIVE_WID" "$x" "$y")
+    if result=$(cua-driver call click "$payload" --compact 2>&1); then rc=0; else rc=$?; fi
+    # Keep the exact Chrome window frontmost long enough for user-activation-gated
+    # handlers (downloads, file pickers, permission prompts) to consume the click.
+    sleep "${WEB_TRUSTED_CLICK_HOLD_SECONDS:-1.0}"
+    restore_ui_context
+    if (( rc != 0 )); then printf '%s\n' "$result" >&2; return "$rc"; fi
+    printf '{"clicked":true,"trusted":true,"x":%s,"y":%s,"text":%s}\n' "$x" "$y" "$(json_quote "$label")"
+}
+
+cmd_trusted_click() {
+    local selector_q
+    selector_q=$(json_quote "${1:?Usage: web trusted-click <selector>}")
+    trusted_click_from_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});if(e.disabled||e.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',selector});e.scrollIntoView({block:'center',inline:'center'});const r=e.getBoundingClientRect(),d=devicePixelRatio||1,ox=Math.max(0,(outerWidth-innerWidth)/2),oy=Math.max(0,outerHeight-innerHeight);return JSON.stringify({x:(ox+r.left+r.width/2)*d,y:(oy+r.top+r.height/2)*d,text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim()})})()"
+}
+
+cmd_trusted_click_text() {
+    local text_q selector_q
+    text_q=$(json_quote "${1:?Usage: web trusted-click-text <text>}")
+    selector_q=$(json_quote "${2:-a,button,input,select,textarea,[role],label,[onclick]}")
+    trusted_click_from_js "(()=>{const needle=$text_q,selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length),txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||''),norm=s=>String(s||'').replace(/\\s+/g,' ').trim().toLowerCase(),q=norm(needle),interactive=e=>/^(A|BUTTON|INPUT|SELECT|TEXTAREA|MAT-OPTION)$/.test(e.tagName)||['button','option','menuitem','radio','checkbox','link','tab'].includes(e.getAttribute('role')),depth=e=>{let d=0;for(let n=e;n;n=n.parentElement)d++;return d};const found=Array.from(document.querySelectorAll(selector)).filter(e=>visible(e)&&norm(txt(e)).includes(q)).map((e,order)=>{const n=norm(txt(e));return{e,order,score:(n===q?100000:n.startsWith(q)?50000:10000)+(interactive(e)?2000:0)+depth(e)*5-Math.min(n.length,1000)}}).sort((a,b)=>b.score-a.score||a.order-b.order)[0]?.e;if(!found)return JSON.stringify({error:'No element found with text',text:needle});if(found.disabled||found.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',text:needle});found.scrollIntoView({block:'center',inline:'center'});const r=found.getBoundingClientRect(),d=devicePixelRatio||1,ox=Math.max(0,(outerWidth-innerWidth)/2),oy=Math.max(0,outerHeight-innerHeight);return JSON.stringify({x:(ox+r.left+r.width/2)*d,y:(oy+r.top+r.height/2)*d,text:txt(found).trim()})})()"
+}
+
+cmd_press() {
+    local key="${1:?Usage: web press <key> [modifier,modifier]}" modifier_csv="${2:-}" payload result rc=0
+    prepare_exact_chrome_target || return 1
+    capture_ui_context
+    activate_exact_chrome_tab
+    sleep 0.15
+    if ! resolve_native_chrome_window; then restore_ui_context; return 1; fi
+    payload=$(python3 -c 'import json,sys; print(json.dumps({"pid":int(sys.argv[1]),"window_id":int(sys.argv[2]),"key":sys.argv[3],"modifiers":[x for x in sys.argv[4].split(",") if x]}))' "$NATIVE_PID" "$NATIVE_WID" "$key" "$modifier_csv")
+    if result=$(cua-driver call press_key "$payload" --compact 2>&1); then rc=0; else rc=$?; fi
+    sleep 0.25
+    restore_ui_context
+    if (( rc != 0 )); then printf '%s\n' "$result" >&2; return "$rc"; fi
+    printf '{"pressed":true,"trusted":true,"key":%s,"modifiers":%s}\n' "$(json_quote "$key")" "$(python3 -c 'import json,sys; print(json.dumps([x for x in sys.argv[1].split(",") if x]))' "$modifier_csv")"
+}
+
+cmd_type() {
+    local selector="${1:?Usage: web type <selector> <value> [return|tab|escape]}"
+    local value="${2:?Usage: web type <selector> <value> [return|tab|escape]}"
+    local commit_key="${3:-}" selector_q geometry parsed x y label payload result rc=0
+    commit_key=$(printf '%s' "$commit_key" | tr '[:upper:]' '[:lower:]')
+    case "$commit_key" in
+        ""|none|return|enter|tab|escape|esc) ;;
+        *) echo "Error: web type commit key must be return, tab, escape, or omitted." >&2; return 1 ;;
+    esac
+
+    selector_q=$(json_quote "$selector")
+    geometry=$(run_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});if(e.disabled||e.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',selector});e.scrollIntoView({block:'center',inline:'center'});const r=e.getBoundingClientRect(),d=devicePixelRatio||1,ox=Math.max(0,(outerWidth-innerWidth)/2),oy=Math.max(0,outerHeight-innerHeight);return JSON.stringify({x:(ox+r.left+r.width/2)*d,y:(oy+r.top+r.height/2)*d,text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim()})})()") || return 1
+    if ! parsed=$(printf '%s' "$geometry" | python3 -c '
+import json, sys
+j=json.load(sys.stdin)
+if j.get("error"): raise SystemExit(j["error"])
+print("{}\t{}\t{}".format(round(float(j["x"])), round(float(j["y"])), str(j.get("text", "")).replace(chr(9), " ")[:120]))
+'); then
+        printf '%s\n' "$geometry" >&2
+        return 1
+    fi
+    IFS=$'\t' read -r x y label <<< "$parsed"
+    [[ "$x" =~ ^-?[0-9]+$ && "$y" =~ ^-?[0-9]+$ ]] || { echo "Error: invalid type coordinates." >&2; return 1; }
+
+    prepare_exact_chrome_target || return 1
+    capture_ui_context
+    activate_exact_chrome_tab
+    sleep 0.15
+    if ! resolve_native_chrome_window; then restore_ui_context; return 1; fi
+    payload=$(printf '{"pid":%s,"window_id":%s,"x":%s,"y":%s,"count":1}' "$NATIVE_PID" "$NATIVE_WID" "$x" "$y")
+    if result=$(cua-driver call click "$payload" --compact 2>&1); then rc=0; else rc=$?; fi
+    if (( rc != 0 )); then restore_ui_context; printf '%s\n' "$result" >&2; return "$rc"; fi
+    # Let Chrome deliver the click/focus transition before sending characters.
+    sleep "${WEB_TRUSTED_TYPE_FOCUS_SECONDS:-0.8}"
+
+    if result=$(osascript - "$value" "$commit_key" <<'APPLESCRIPT'
+on run argv
+  set payload to item 1 of argv
+  set commitKey to item 2 of argv
+  tell application "System Events"
+    keystroke "a" using command down
+    delay 0.03
+    keystroke payload
+    delay 0.03
+    if commitKey is "return" or commitKey is "enter" then
+      key code 36
+    else if commitKey is "tab" then
+      key code 48
+    else if commitKey is "escape" or commitKey is "esc" then
+      key code 53
+    end if
+  end tell
+end run
+APPLESCRIPT
+); then rc=0; else rc=$?; fi
+    sleep 0.25
+    restore_ui_context
+    if (( rc != 0 )); then printf '%s\n' "$result" >&2; return "$rc"; fi
+    printf '{"typed":true,"trusted":true,"selector":%s,"characters":%s,"commitKey":%s}\n' "$(json_quote "$selector")" "${#value}" "$(json_quote "$commit_key")"
 }
 
 # --- Chrome tabs via AppleScript ---
@@ -604,7 +933,8 @@ APPLESCRIPT
 }
 
 cmd_switch() {
-    local target="${1:?Usage: web switch <index|url|title>}" result
+    local target="${1:?Usage: web switch <index|url|title|tab:ID>}" result
+    [[ "$target" == tab:* ]] && target="${target#tab:}"
     ensure_session
     capture_ui_context
     result=$(osascript - "$SESSION_WINDOW_ID" "$target" <<'APPLESCRIPT'
@@ -659,6 +989,7 @@ on run argv
     repeat with w in windows
       if (id of w as text) is wantedWindow then
         set newTab to make new tab at end of tabs of w with properties {URL:targetUrl}
+        set active tab index of w to count of tabs of w
         return id of newTab as text
       end if
     end repeat
@@ -674,7 +1005,8 @@ APPLESCRIPT
 }
 
 cmd_closetab() {
-    local target="${1:?Usage: web closetab <index|url|title>}" result closed_id remaining_id
+    local target="${1:?Usage: web closetab <index|url|title|tab:ID>}" result closed_id remaining_id
+    [[ "$target" == tab:* ]] && target="${target#tab:}"
     ensure_session
     capture_ui_context
     result=$(osascript - "$SESSION_WINDOW_ID" "$target" <<'APPLESCRIPT'
@@ -842,7 +1174,8 @@ SESSION:
 NAVIGATION:
   web nav <url>                 # Go to URL in active tab
   web url / title               # Current URL / title
-  web wait <ms>                 # Check readyState, sleep only if not complete
+  web wait <ms>                 # Readiness wait; returns immediately if complete
+  web sleep <ms>                # Always pause for the requested duration
 
 READING:
   web summary                   # Title, headings, buttons, links, forms
@@ -856,9 +1189,13 @@ READING:
   web value <selector>          # Read element value/text
 
 ACTIONS:
-  web click <selector>          # Click by CSS selector
-  web click-text <text> [tags]  # Click by visible text
-  web fill <selector> <value>   # Fill input + fire input/change events
+  web click <selector>          # Fast synthetic DOM click by CSS selector
+  web click-text <text> [tags]  # Fast synthetic DOM click by ranked visible text
+  web trusted-click <selector>  # Real foreground click for downloads/pickers/permissions
+  web trusted-click-text <text> [tags] # Real foreground click by ranked visible text
+  web press <key> [mods]        # Real key press; mods are comma-separated
+  web fill <selector> <value>   # Fast background fill + synthetic framework events
+  web type <selector> <value> [return|tab|escape] # Real typing for controls that reject fill
   web select <selector> <text>  # Select dropdown option by text/value
   web submit <form>             # Submit form
   web scroll <pixels>           # Scroll (positive down, negative up)
@@ -870,7 +1207,8 @@ TABS (AppleScript, no pid/wid needed):
   web closetab <N|url|title>    # Close a Pi Automation tab
 
 ADVANCED:
-  web run <js>                  # Run synchronous JS in active page
+  web run <js>                  # Run synchronous JS in the automation DOM world
+  web run-main <js>             # Run synchronous JS with page-owned framework state
   web cart                      # Shopify cart contents
 
 IMPORTANT:
@@ -881,13 +1219,16 @@ IMPORTANT:
   - switch/newtab do not activate Chrome or steal focus.
   - Use this instead of AX tree for web content.
   - For async-like page/network work inside JS, use synchronous XMLHttpRequest.
-  - Tab commands use AppleScript; page commands use cua-driver page tools.
+  - Synthetic click is fastest; trusted-click temporarily fronts the exact target and restores focus.
+  - Tab commands use AppleScript; trusted input uses Cua; normal page commands use DOM JavaScript.
 HELP
 }
 
 # --- Main ---
 cmd="${1:-help}"
 shift || true
+
+case "$cmd" in help|--help|-h) ;; *) acquire_session_lock ;; esac
 
 case "$cmd" in
     auto)         cmd_auto ;;
@@ -910,12 +1251,18 @@ case "$cmd" in
     find-inputs)  ensure_target; cmd_find_inputs ;;
     click)        ensure_target; cmd_click "${1:?Usage: web click <selector>}" ;;
     click-text)   ensure_target; cmd_click_text "${1:?Usage: web click-text <text>}" "${2:-}" ;;
+    trusted-click) ensure_target; cmd_trusted_click "${1:?Usage: web trusted-click <selector>}" ;;
+    trusted-click-text) ensure_target; cmd_trusted_click_text "${1:?Usage: web trusted-click-text <text>}" "${2:-}" ;;
+    press)        ensure_target; cmd_press "${1:?Usage: web press <key> [modifier,modifier]}" "${2:-}" ;;
     fill)         ensure_target; cmd_fill "${1:?Usage: web fill <selector> <value>}" "${2:?Usage: web fill <selector> <value>}" ;;
+    type)         ensure_target; cmd_type "${1:?Usage: web type <selector> <value> [return|tab|escape]}" "${2:?Usage: web type <selector> <value> [return|tab|escape]}" "${3:-}" ;;
     select)       ensure_target; cmd_select "${1:?Usage: web select <selector> <option-text>}" "${2:?Usage: web select <selector> <option-text>}" ;;
     submit)       ensure_target; cmd_submit "${1:?Usage: web submit <form-selector>}" ;;
     scroll)       ensure_target; cmd_scroll "${1:?Usage: web scroll <pixels>}" ;;
     run)          ensure_target; cmd_run "$@" ;;
+    run-main)     ensure_target; cmd_run_main "$@" ;;
     wait)         ensure_target; cmd_wait "${1:?Usage: web wait <milliseconds>}" ;;
+    sleep)        ensure_target; cmd_sleep "${1:?Usage: web sleep <milliseconds>}" ;;
     cart)         ensure_target; cmd_cart ;;
     exists)       ensure_target; cmd_exists "${1:?Usage: web exists <selector>}" ;;
     value)        ensure_target; cmd_value "${1:?Usage: web value <selector>}" ;;
