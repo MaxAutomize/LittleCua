@@ -134,6 +134,41 @@ Start Pi and just ask — the model picks the right tool:
 - *"In System Settings, turn on Developer Mode"* → `cua_driver` workflow sequence
 - *"Fill the login form on the site I'm on and submit"* → `web_cli` sequence
 
+### Direct visual feedback (v1.2)
+
+Screenshots and zoom results are delivered as actual images to vision-capable models, without a separate file-read call. Native action batches can optionally return one fresh screenshot of their exact target window:
+
+```json
+{
+  "action": "workflow",
+  "screenshotAfter": true,
+  "workflow": {
+    "action": "sequence",
+    "app": "Calculator",
+    "steps": [{ "action": "inspect", "query": "Calculator" }]
+  }
+}
+```
+
+- `screenshotAfter` defaults to **false**, preserving the fast AX/DOM path. Use it when visual feedback matters.
+- Explicit target required; supported workflow actions are `inspect`, `act`, `sequence`, `launch`, and `activate`. Put program steps inside a sequence for program-plus-image results.
+- This is **on-demand screenshot capture, not continuous video recording**. macOS's Screen Recording permission also covers still screenshots.
+- Temporary capture files are removed after inline delivery; images remain in the Pi conversation. Explicit output paths are retained. Use `returnImage: false` for file-only delivery; text-only models also receive a file path instead.
+- Missing/stale images are not attached. Post-action capture failure does not repeat completed actions.
+
+This reduces screenshot → read from **two tool calls to one**, and workflow → screenshot → read from **three to one**. Local direct screenshot calls measured about **0.15 seconds**; no end-to-end task speedup percentage has been established. See [workflow documentation](extensions/cua-tool/NATIVE_WORKFLOW.md) for details.
+
+### Tests
+
+With Pi installed globally, run from the repository root:
+
+```bash
+npm test            # regression tests; no desktop access
+npm run test:live   # read-only Calculator captures; macOS + open Calculator required
+```
+
+Tests reuse Pi's bundled loader/dependencies. For a non-global Pi installation, set `PI_PACKAGE_DIR` to its package directory. Live tests do not click or type.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -158,6 +193,8 @@ LittleCua/
     ├── cua-tool/
     │   ├── index.ts              # cua_driver tool
     │   ├── native-workflow.ts     # action: "workflow" implementation
+    │   ├── visual-results.ts      # inline images + optional post-batch capture
+    │   ├── tests/                 # regression + read-only live smoke tests
     │   ├── sitegeist-runtime.ts  # shared Sitegeist handoff runtime
     │   └── NATIVE_WORKFLOW.md     # workflow docs
     └── web-cli/

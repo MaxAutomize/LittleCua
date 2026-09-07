@@ -102,7 +102,44 @@ Raw full-power call:
 ## Unified routing
 
 - Native apps: `cua_driver` with `action: "workflow"` as the primary path; keep multi-step work in one sequence.
-- Native visual inspection, screenshots, and zoom: direct `cua_driver` actions.
+- Native visual inspection, screenshots, and zoom: direct `cua_driver` actions return actual image blocks to vision models (not merely file paths).
 - Chrome page content: `web` CLI.
 - Hard visual web flows: Sitegeist, which uses the same CuaDriver daemon and adaptive polling.
 - Legacy VM/sandbox Cua commands remain separate compatibility surfaces.
+
+## On-demand visual feedback (Astra and other vision models)
+
+`Screen Recording` is the macOS permission for screenshots as well as video. OpenAI's documented Astra computer-use integration uses screenshots and tool results, recommends code execution/batching, and allows existing custom UI tools. A continuous recording is not required.
+
+The wrapper now attaches actual PNG/JPEG bytes for `screenshot` and `zoom`. Previously, the CLI could save a file or print a capture summary without delivering an image to Pi, requiring another `read` tool call. `window_state` can also attach a newly written explicitly requested output file, but AX mode still intentionally skips screen capture.
+
+Use top-level `screenshotAfter: true` on a **single-target** `workflow` to return one image of the exact resolved window after the batch:
+
+```json
+{
+  "action": "workflow",
+  "screenshotAfter": true,
+  "workflow": {
+    "action": "sequence",
+    "app": "Calculator",
+    "steps": [{"action": "inspect", "query": "Calculator"}]
+  }
+}
+```
+
+Supported workflow actions: `inspect`, `act`, `sequence`, `launch`, `activate`. For a program plus screenshot, put a `program` step inside `sequence`; standalone programs do not return an exact resolved target. Parallel post-capture is deliberately unsupported. An explicit app/bundleId/pid/windowId is required; there is no fallback to capturing another window. Screenshot failure does not replay completed actions.
+
+- Keep `screenshotAfter` off for routine semantic/DOM tasks. It adds capture and model image-processing cost; use it when visual outcome matters.
+- No recorder, frame polling, persistent video stream, global capture-mode changes, new permissions, or model change is introduced.
+- PNG/JPEG dimensions are not rescaled by the wrapper. Window pixel coordinates remain those supplied by CuaDriver; zoom still requires `fromZoom=true`.
+- Automatically created images use private temporary directories, deleted after inline delivery. Images remain in the Pi conversation/model context under normal session retention.
+- Explicit `screenshotOutFile`/`imageOut` files are retained. `returnImage:false` or a text-only model keeps the image as a file instead. Missing/unchanged stale files are never attached. Inline images are capped at 8 MiB.
+- Direct screenshot requests with only `appName` require one unambiguous visible window, rather than silently capturing the whole desktop.
+
+Validation from the repository root: `npm test` (mock regression cases) and `npm run test:live` (read-only Calculator test; Calculator must be open). Tests reuse a global Pi installation, or `PI_PACKAGE_DIR` for a custom installation. The live test captures only Calculator and never clicks or types.
+
+Local test on 2026-09-06: three direct image calls took 152/161/131 ms; read-only AX batch plus image took 672/271/241 ms (first call cold). These are local tool timings, not end-to-end model benchmarks. The structural saving is one model/tool round trip for screenshot → read, or up to two for workflow → screenshot → read.
+
+Sources:
+- https://learn.chatgpt.com/docs/computer-use
+- https://developers.openai.com/api/docs/guides/tools-computer-use
