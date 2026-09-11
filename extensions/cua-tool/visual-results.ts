@@ -46,8 +46,8 @@ export function withVisualResults(tool: any, pi: any, bin: string) {
       const dir = explicitPath ? undefined : mkdtempSync(join(tmpdir(), "pi-cua-visual-"));
       const path = explicitPath ?? join(dir!, raw.format === "jpeg" ? "frame.jpg" : "frame.png");
       const before = signature(path);
-      let cleanup = !!dir;
       const started = performance.now();
+      const captureRequestedAt = new Date().toISOString();
       try {
         signal?.throwIfAborted();
         // Resolve an explicitly named screenshot app instead of accidentally taking
@@ -84,20 +84,26 @@ export function withVisualResults(tool: any, pi: any, bin: string) {
         if (!fresh || fresh === before) {
           return { ...result, content: [...result.content, { type: "text", text: "No fresh image produced; no old image attached. AX-only window_state intentionally skips capture. Use action=screenshot for pixels." }], details: { ...result.details, imageAttached: false } };
         }
+        const captureBytes = statSync(path).size;
+        if (captureBytes > MAX_IMAGE_BYTES) {
+          return { ...result, content: [...result.content, { type: "text", text: `Fresh frame is ${captureBytes} bytes, above the ${MAX_IMAGE_BYTES}-byte attachment bound; no image attached.` }], details: { ...result.details, imageAttached: false, imageBytes: captureBytes, temporaryImageRemoved: !!dir } };
+        }
         const supportsImages = !ctx?.model || ctx.model.input?.includes("image");
         if (raw.returnImage === false || !supportsImages) {
-          cleanup = false;
-          return { ...result, content: [...result.content, { type: "text", text: `Fresh image saved: ${path}. Inline delivery disabled${!supportsImages ? " (model does not advertise vision)" : ""}.` }], details: { ...result.details, screenshotOutFile: path, imageAttached: false } };
+          const note = explicitPath
+            ? `Fresh image saved: ${path}.`
+            : 'Fresh temporary image discarded. Supply screenshotOutFile or imageOut explicitly to retain a file.';
+          return { ...result, content: [...result.content, { type: "text", text: `${note} Inline delivery disabled${!supportsImages ? " (model does not advertise vision)" : ""}.` }], details: { ...result.details, screenshotOutFile: explicitPath, imageAttached: false, temporaryImageRemoved: !!dir, captureRequestedAt } };
         }
         let image;
         try { image = readImage(path); } catch (error) {
           return { ...result, content: [...result.content, { type: "text", text: `Image attachment unavailable: ${String(error)}. Do not repeat completed actions.` }], details: { ...result.details, imageAttached: false } };
         }
         const dims = image.dimensions;
-        const note = `${after ? "Post-action window image" : "Fresh capture"}${dims ? `: ${dims.width}×${dims.height} pixels` : ""}. ${raw.action === "zoom" ? "Zoom coordinates require fromZoom=true." : "For window captures, use image pixels exactly; do not Retina-scale or add window origin."}${dir ? " Temporary capture file removed after attachment; image remains in the Pi conversation." : ` File retained: ${path}`}`;
-        return { ...result, content: [...result.content, { type: "text", text: note }, image.block], details: { ...result.details, imageAttached: true, imageBytes: image.bytes, imageDimensions: dims, temporaryImageRemoved: !!dir, visualTotalMs: performance.now() - started } };
+        const note = `One on-demand frame (not continuous observation). ${after ? "Post-action window image" : "Fresh capture"}${dims ? `: ${dims.width}×${dims.height} pixels` : ""}. ${raw.action === "zoom" ? "Zoom coordinates require fromZoom=true." : "For window captures, use image pixels exactly; do not Retina-scale or add window origin."}${dir ? " Temporary capture file removed after attachment; image remains in the Pi conversation." : ` File retained: ${path}`}`;
+        return { ...result, content: [...result.content, { type: "text", text: note }, image.block], details: { ...result.details, imageAttached: true, imageBytes: image.bytes, imageDimensions: dims, temporaryImageRemoved: !!dir, captureRequestedAt, captureCompletedAt: new Date().toISOString(), visualTotalMs: performance.now() - started } };
       } finally {
-        if (cleanup && dir) rmSync(dir, { recursive: true, force: true });
+        if (dir) rmSync(dir, { recursive: true, force: true });
       }
     },
   };

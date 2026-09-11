@@ -153,8 +153,10 @@ Screenshots and zoom results are delivered as actual images to vision-capable mo
 - `screenshotAfter` defaults to **false**, preserving the fast AX/DOM path. Use it when visual feedback matters.
 - Explicit target required; supported workflow actions are `inspect`, `act`, `sequence`, `launch`, and `activate`. Put program steps inside a sequence for program-plus-image results.
 - This is **on-demand screenshot capture, not continuous video recording**. macOS's Screen Recording permission also covers still screenshots.
-- Temporary capture files are removed after inline delivery; images remain in the Pi conversation. Explicit output paths are retained. Use `returnImage: false` for file-only delivery; text-only models also receive a file path instead.
+- Temporary capture files are always discarded; images remain in the Pi conversation. Explicit output paths are retained. Use `returnImage: false` with `screenshotOutFile`/`imageOut` for file-only delivery; implicit files are still discarded.
 - Missing/stale images are not attached. Post-action capture failure does not repeat completed actions.
+- Native clicks use AX to identify controls. `clickMode: "auto"` falls back to a fresh-frame mouse click for non-pressable controls; `mouse` forces that path and `ax` refuses fallback. Ambiguous or moving bounds fail closed.
+- `web_cli` click/click-text/type already target DOM controls directly; use trusted click/type only for custom inputs or gesture gates. Cua is not used for ordinary web DOM work.
 
 This reduces screenshot → read from **two tool calls to one**, and workflow → screenshot → read from **three to one**. Local direct screenshot calls measured about **0.15 seconds**; no end-to-end task speedup percentage has been established. See [workflow documentation](extensions/cua-tool/NATIVE_WORKFLOW.md) for details.
 
@@ -163,7 +165,7 @@ This reduces screenshot → read from **two tool calls to one**, and workflow �
 With Pi installed globally, run from the repository root:
 
 ```bash
-npm test            # regression tests; no desktop access
+npm test            # regression tests; no desktop access (includes pointer routing)
 npm run test:live   # read-only Calculator captures; macOS + open Calculator required
 ```
 
@@ -192,7 +194,8 @@ LittleCua/
 └── extensions/
     ├── cua-tool/
     │   ├── index.ts              # cua_driver tool
-    │   ├── native-workflow.ts     # action: "workflow" implementation
+    │   ├── native-workflow-speed.ts # action: "workflow" implementation
+    │   ├── native-pointer.ts      # bounded AX-bounds mouse fallback
     │   ├── visual-results.ts      # inline images + optional post-batch capture
     │   ├── tests/                 # regression + read-only live smoke tests
     │   ├── sitegeist-runtime.ts  # shared Sitegeist handoff runtime

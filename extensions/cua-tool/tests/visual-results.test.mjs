@@ -60,11 +60,12 @@ await test('explicit output retained; stale existing image never attached', asyn
     assert.equal(r.details.imageAttached, false); assert.equal(r.content.some(x => x.type === 'image'), false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-await test('text-only model and returnImage=false preserve file fallback', async () => {
+await test('text-only model and returnImage=false discard implicit files', async () => {
   for (const [args, ctx] of [[{ returnImage: false }, vision], [{}, { model: { input: ['text'] } }]]) {
     const s = setup(); const r = await execute(s, { action: 'screenshot', windowId: 456, ...args }, ctx);
-    try { assert.equal(r.details.imageAttached, false); assert.equal(existsSync(s.path()), true); }
-    finally { rmSync(join(s.path(), '..'), { recursive: true, force: true }); }
+    assert.equal(r.details.imageAttached, false);
+    assert.equal(existsSync(s.path()), false);
+    assert.equal(r.details.temporaryImageRemoved, true);
   }
 });
 await test('cancellation before execution', async () => {
@@ -75,5 +76,22 @@ await test('cancellation before execution', async () => {
 await test('zoom returns native image', async () => {
   const s = setup(); const r = await execute(s, { action: 'zoom', pid: 123, x1: 0, y1: 0, x2: 50, y2: 50 });
   assert.equal(r.content.at(-1).type, 'image'); assert.match(r.content.at(-2).text, /fromZoom=true/);
+});
+await test('explicit no-inline capture retained', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cua-test-'));
+  try {
+    const path = join(dir, 'frame.png'); const s = setup();
+    const r = await execute(s, {action:'screenshot', windowId:456, returnImage:false, imageOut:path});
+    assert.equal(existsSync(path), true); assert.equal(r.details.imageAttached, false);
+  } finally { rmSync(dir, {recursive:true, force:true}); }
+});
+await test('repeated captures do not retain a sequence of files', async () => {
+  const s = setup();
+  for (let i=0; i<20; i++) {
+    const r = await execute(s, {action:'screenshot', windowId:456});
+    assert.equal(existsSync(s.path()), false);
+    assert.equal(r.content.filter(c=>c.type==='image').length, 1);
+    assert.ok(r.details.captureRequestedAt); assert.ok(r.details.captureCompletedAt);
+  }
 });
 console.log(`${count} tests passed`);

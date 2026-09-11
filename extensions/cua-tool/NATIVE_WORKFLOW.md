@@ -10,6 +10,7 @@ Primary fast native automation built directly into the Pi `cua_driver` tool as `
 - Returns one compact success/performance line by default instead of feeding every intermediate observation back to the model.
 - Targets named background windows instead of depending on whichever app the user currently has focused.
 - Resolves labeled elements by text/role and unlabeled elements by role/occurrence inside the tool.
+- For native clicks, AX identifies the target first. `clickMode: "auto"` uses supported AXPress where available and uses a bounded, visible-window mouse fallback for non-pressable rows/labels; `clickMode: "mouse"` forces that path and `clickMode: "ax"` refuses fallback. Ambiguous or moving bounds fail closed.
 - Caches app PID + exact window ID for five minutes and self-heals a stale target once.
 - Starts the CuaDriver service on demand; an always-running login daemon is not required.
 - Cua CLI calls are typically 15–25 ms; AX snapshots are typically 100–300 ms, so avoiding snapshots is the main latency win.
@@ -103,7 +104,7 @@ Raw full-power call:
 
 - Native apps: `cua_driver` with `action: "workflow"` as the primary path; keep multi-step work in one sequence.
 - Native visual inspection, screenshots, and zoom: direct `cua_driver` actions return actual image blocks to vision models (not merely file paths).
-- Chrome page content: `web` CLI.
+- Chrome page content: `web_cli`. `web_cli` click/click-text/type already target DOM controls by selector/text without ad-hoc JavaScript. DOM clicks remain valid; trusted click/type is for custom inputs or gesture gates.
 - Hard visual web flows: Sitegeist, which uses the same CuaDriver daemon and adaptive polling.
 - Legacy VM/sandbox Cua commands remain separate compatibility surfaces.
 
@@ -132,13 +133,13 @@ Supported workflow actions: `inspect`, `act`, `sequence`, `launch`, `activate`. 
 - Keep `screenshotAfter` off for routine semantic/DOM tasks. It adds capture and model image-processing cost; use it when visual outcome matters.
 - No recorder, frame polling, persistent video stream, global capture-mode changes, new permissions, or model change is introduced.
 - PNG/JPEG dimensions are not rescaled by the wrapper. Window pixel coordinates remain those supplied by CuaDriver; zoom still requires `fromZoom=true`.
-- Automatically created images use private temporary directories, deleted after inline delivery. Images remain in the Pi conversation/model context under normal session retention.
+- Automatically created images use private temporary directories, deleted after the request whether or not inline delivery is enabled. Explicit `screenshotOutFile`/`imageOut` files are retained. Images attached to Pi still follow normal session retention.
 - Explicit `screenshotOutFile`/`imageOut` files are retained. `returnImage:false` or a text-only model keeps the image as a file instead. Missing/unchanged stale files are never attached. Inline images are capped at 8 MiB.
 - Direct screenshot requests with only `appName` require one unambiguous visible window, rather than silently capturing the whole desktop.
 
-Validation from the repository root: `npm test` (mock regression cases) and `npm run test:live` (read-only Calculator test; Calculator must be open). Tests reuse a global Pi installation, or `PI_PACKAGE_DIR` for a custom installation. The live test captures only Calculator and never clicks or types.
+Validation: `node ~/.pi/agent/extensions/cua-tool/tests/native-pointer.test.mjs` (bounded AX-geometry/mouse-routing mock) and `node ~/.pi/agent/extensions/cua-tool/tests/visual-results.test.mjs` (capture regression cases), plus `node ~/.pi/agent/extensions/cua-tool/tests/visual-live.mjs` (read-only Calculator test; Calculator must be open). The live test captures only Calculator and never clicks or types.
 
-Local test on 2026-09-06: three direct image calls took 152/161/131 ms; read-only AX batch plus image took 672/271/241 ms (first call cold). These are local tool timings, not end-to-end model benchmarks. The structural saving is one model/tool round trip for screenshot → read, or up to two for workflow → screenshot → read.
+Local test on 2026-09-06: three direct image calls took 152/161/131 ms; read-only AX batch plus image took 672/271/241 ms (first call cold). These are local tool timings, not end-to-end model benchmarks. The structural saving is one model/tool round trip for screenshot → read, or up to two for workflow → screenshot → read. This is bounded on-demand capture, not continuous model sight: no recorder or frame polling starts by default.
 
 Sources:
 - https://learn.chatgpt.com/docs/computer-use
