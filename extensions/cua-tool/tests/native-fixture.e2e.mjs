@@ -22,6 +22,8 @@ const reportPath = join(reportDir, `native-interaction-${new Date().toISOString(
 let processHandle;
 let priorApp = '';
 let tool;
+let nativeSession;
+const useNativeMcp = process.env.CUA_TEST_NATIVE_MCP === '1';
 let failure;
 let cleanupFailure;
 const metrics = { scenarios: 0, passedScenarios: 0, failedScenarios: 0, assertions: 0 };
@@ -76,7 +78,8 @@ async function scenario(name, fn) {
 }
 async function waitForWindows(titlePart, count = 2) {
   for (let i = 0; i < 60; i++) {
-    const result = await shell('cua-driver', ['call', 'list_windows', '{"on_screen_only":true}', '--compact'], { timeout: 5000 });
+    const nativeResult = nativeSession ? await nativeSession.call({action:'list_windows',onScreenOnly:true}) : undefined;
+    const result = nativeResult ? {code:nativeResult.isError ? 1 : 0,stdout:nativeResult.details.stdout} : await shell('cua-driver', ['call', 'list_windows', '{"on_screen_only":true}', '--compact'], { timeout: 5000 });
     if (result.code === 0) {
       const windows = JSON.parse(result.stdout).windows.filter(w => w.title?.includes(titlePart) && w.is_on_screen && w.on_current_space !== false);
       if (windows.length >= count) return windows;
@@ -85,8 +88,12 @@ async function waitForWindows(titlePart, count = 2) {
   }
   throw new Error(`Fixture windows did not appear: ${titlePart}`);
 }
-function makeTool() {
-  extension({ registerTool: t => tool = t, exec: shell });
+async function makeTool() {
+  if (useNativeMcp) {
+    const {nativeMcpSession} = await import('./native-mcp-session.mjs');
+    nativeSession = await nativeMcpSession();
+    tool = {execute:(_id,args,signal)=>nativeSession.call(args,signal)};
+  } else extension({ registerTool: t => tool = t, exec: shell });
   checkOk(tool, 'Cua tool was not registered');
 }
 const call = (args, signal) => tool.execute('native-grid-matrix', args, signal, undefined, { model: { input: ['text'] } });
@@ -215,7 +222,7 @@ try {
     priorApp = await frontApp();
     const compile = await shell('xcrun', ['swiftc', join(process.cwd(), 'extensions/cua-tool/tests/native-fixture.swift'), '-o', binary], { timeout: 120000 });
     checkEqual(compile.code, 0, compile.stderr);
-    makeTool();
+    await makeTool();
     const targets = await startFixture();
     checkEqual(targets.a.pid, targets.b.pid, 'two fixture windows share the one self-owned process');
     checkEqual(targets.a.title, 'LittleCua Fixture A', 'window A exact title');
@@ -424,11 +431,16 @@ try {
     await assertCompleteState(targets.a, expectedA, 'final A');
     await assertCompleteState(targets.b, expectedB, 'final B');
     checkEqual(readOracle().windows.length, 2, 'oracle contains exactly two fixture windows');
+    if (nativeSession) {
+      checkEqual(nativeSession.cli.filter(([,args])=>args[0]==='call').length,0,'no per-operation Cua CLI process');
+      checkOk(nativeSession.events.some(e=>e.name==='mcp__cua_native__click' && e.parent),'native MCP clicks passed Pi nested permission hooks');
+    }
   });
 } catch (error) {
   failure = error;
 } finally {
   try { await stopFixture(); } catch (error) { cleanupFailure = error; }
+  try { await nativeSession?.close(); } catch (error) { cleanupFailure = cleanupFailure ?? error; }
   try { await restoreApp(priorApp); } catch (error) { cleanupFailure = cleanupFailure ?? error; }
   try {
     const pointerDirsAfter = readdirSync(tmpdir()).filter(name => name.startsWith('pi-cua-pointer-'));
@@ -440,6 +452,9 @@ try {
       '# LittleCua Native Interaction Matrix',
       '',
       `- Generated: ${new Date().toISOString()}`,
+      `- Transport: ${useNativeMcp ? 'Pi native MCP through the real nested-tool pipeline' : 'legacy CLI'}`,
+      `- Native MCP calls observed by permission hooks: ${nativeSession?.events.length ?? 0}`,
+      `- Per-operation Cua CLI calls: ${nativeSession ? nativeSession.cli.filter(([,args])=>args[0]==='call').length : 'legacy path'}`,
       `- Driver: cua-driver ${String((await shell('cua-driver', ['--version'], { timeout: 5000 })).stdout).trim()}`,
       `- Process-local fixture runtime: ${((Date.now() - startedAt) / 1000).toFixed(3)} s`,
       `- Overall result: ${failure || cleanupFailure ? 'FAIL' : 'PASS'}`,

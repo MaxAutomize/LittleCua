@@ -1,232 +1,158 @@
 # LittleCua
 
-Two [Pi](https://pi.dev) coding-agent extensions, packaged together so a single `pi install` gives your agent both **native macOS automation** and **live Chrome control**:
+**Native macOS + authenticated Chrome automation for [Pi](https://pi.dev), using Pi-owned persistent MCP connections.**
 
-| Tool | Extension | What it does |
-|------|-----------|--------------|
-| `cua_driver` | `extensions/cua-tool` | Drive native macOS apps (Xcode, Finder, System Settings, Blender, …) via the CuaDriver daemon — screenshots, clicks, typing, semantic AX selectors, 30-step workflows, AppleScript. **macOS only.** |
-| `web_cli`   | `extensions/web-cli` | Fast DOM control of your live authenticated Chrome (macOS) through a cached CuaDriver page channel, with AppleScript reserved for setup and exact-tab fallbacks — navigate, read, click, fill, run JS, manage tabs, and chain 30-step sequences. |
+| Agent tool | Transport | Use it for |
+|---|---|---|
+| `cua_driver` | `cua_native` → `cua-driver mcp` | Native apps, AX targeting, real mouse/keyboard input, screenshots and batched workflows |
+| `web_cli` | `web_native` → `cua-driver mcp` (`page` only) | Chrome DOM work in the persistent **Pi Automation** window, using your normal signed-in profile |
 
-Both register as LLM-callable tools inside Pi, so once installed the model can use them directly.
+Keep using these high-level tools, not raw MCP calls. They preserve target identity, batching, deadlines, permission hooks, screenshots and no-replay safeguards. LittleCua remains **macOS-only**, even if newer upstream drivers support other platforms.
 
----
+## Required dependencies
 
-## 1. Install Pi (the only hard dependency)
+| Dependency | Requirement / purpose |
+|---|---|
+| Node + npm | **Node >=22.19.0**, matching current Pi's host requirement |
+| Pi | A current version with built-in MCP enabled, `pi.registerMcpServer()` and `ctx.executeTool()`; this sync was checked with **Pi 1.0.1** |
+| CuaDriver | Installed native app/binary providing `mcp` and `dump-docs`; this integration was checked against **0.1.4**. See [upstream native-driver documentation](https://github.com/trycua/cua/tree/main/libs/cua-driver) for installation |
+| Google Chrome | `/Applications/Google Chrome.app`; sign in yourself to the accounts you want to automate |
+| Python 3 | Browser compatibility-route JSON/geometry handling (`brew install python` if missing) |
+| Xcode Command Line Tools | Swift helpers for elevated native windows, local OCR and disposable fixtures; install with `xcode-select --install` |
+| macOS permissions | Accessibility, Screen Recording for captures, and Automation/System Events/Chrome approval when macOS requests it |
+| Chrome setting | **View → Developer → Allow JavaScript from Apple Events** for the browser bootstrap/compatibility path |
 
-Pi is the host agent these extensions plug into. Install it once:
+Pi supplies `@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai` and `typebox`; they are peer dependencies, not bundled copies. No separate npm MCP adapter, Python Cua SDK, Docker/VM, cloud account, or private MCP client is required. AppleScript, AppKit, CoreGraphics and Vision are supplied by macOS; Swift requires the developer tools above.
+
+Don't blindly upgrade a working driver: inspect its schema first. A newer upstream release is **not automatically certified compatible** with this wrapper. Fix the reusable integration and test it before changing transport or resuming an uncertain action.
+
+## Install
 
 ```bash
-# Node 18+ required
-brew install node       # or: use mise / nvm / asdf
-
-# Pi
+brew install node python
 npm install -g @earendil-works/pi-coding-agent
-# or
-pi installer            # official guided installer
+xcode-select --install   # if the Command Line Tools are missing
+# Install CuaDriver and Chrome, then grant permissions yourself.
+
+git clone https://github.com/MaxAutomize/LittleCua.git
+cd LittleCua
+npm run doctor
+./install.sh
 ```
 
-Verify:
+The setup script checks prerequisites, saves a backup of an existing browser shim, installs the matching bundled `scripts/web` at `~/.local/bin/web` (or `WEB_CLI_PATH`), and registers the local checkout with Pi. It does **not** download/update the driver, change TCC permissions, or configure a login daemon. No driver PATH symlink is needed for the default app-bundle installation.
 
-```bash
-pi --version
-```
-
-> The Pi framework packages (`@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai`, `typebox`) are declared as `peerDependencies` in this repo's `package.json` and are provided by Pi itself — you do **not** install them separately.
-
----
-
-## 2. Install this package (one command)
-
-From anywhere:
+Alternatively, register the git package:
 
 ```bash
 pi install git:github.com/MaxAutomize/LittleCua
 ```
 
-That clones the repo into `~/.pi/agent/git/github.com/MaxAutomize/LittleCua`, runs `npm install` for any runtime deps, and registers the package in `~/.pi/agent/settings.json`. The two tools (`cua_driver`, `web_cli`) are now available to every Pi session.
+That installs the extensions, **not the native prerequisites or browser shim**. From that package's checkout, run `./install.sh`, or copy its matching `scripts/web` to `~/.local/bin/web` and make it executable. Keep the shim and `dom-templates.json` from the **same revision**.
 
-To try it without permanently installing:
+Reload Pi with `/reload`. In `/mcp`, confirm **cua_native** and **web_native** are connected. These are registered by the extensions; do not add duplicate entries to `mcp.json`. A file-configured server with the same name overrides the extension registration. `pi mcp list` does not load extensions, so use the **in-session `/mcp`** to diagnose these servers. Remove any conflicting third-party `/mcp` adapter or duplicate LittleCua extension copies.
 
-```bash
-pi -e git:github.com/MaxAutomize/LittleCua
-```
+## Current transport behavior
 
-Reload Pi (or run `/reload`) after installing to pick up the new tools.
+- Pi owns stdio startup/shutdown, connection handling, argument validation, permission hooks and nested-call attribution.
+- Native actions use the persistent `cua_native` connection. AX indices, zoom and recording state belong to that connection, not the separate legacy daemon. Re-inspect after reconnect before using cached targeting data.
+- Chrome's warm dedicated-session DOM path uses `web_native`, without per-action CLI launches. Tab management/bootstrap, exact inactive tabs and trusted real input retain **preselected compatibility routes**. This is intentionally hybrid, not a claim that every action is subprocess-free.
+- An MCP error, timeout, missing tool, permission denial or uncertain result **never triggers a CLI retry**.
+- Real mouse movement, clicks, focus takeover and keyboard input remain available. The decorative animated pointer is disabled by default; native input itself is not removed.
+- `npm run doctor` is read-only: it checks local prerequisites and generated-source integrity, not actual TCC access, MCP connection health or workflow success.
 
----
+`/cua-transport` and `/web-transport` report mode. `... mcp` restores native mode; `... cli` selects an **explicit whole-session rollback** and reloads. Older Pi hosts without registration support choose legacy mode at load time; upgrade Pi for the documented MCP setup. Never switch transports to bypass permissions or replay an action whose outcome is unknown.
 
-## 3. Install the native runtimes these tools drive
+## Minimum-call workflows
 
-> **macOS only.** Both tools are thin TypeScript wrappers around macOS-native runtimes. `cua_driver` shells out to **CuaDriver.app**, and `web_cli` shells out to a custom **`web` bash shim** that drives Chrome through **AppleScript** (`osascript`) and CuaDriver's page tools. Neither AppleScript nor CuaDriver exist on Windows/Linux, so this whole package is macOS-only. The extension TypeScript itself is plain cross-platform code; only the runtimes it calls are macOS-bound.
-
-### cua_driver → CuaDriver.app
-
-```bash
-# Option A: download the app
-#   https://github.com/cua-framework/cua/releases  →  CuaDriver.app
-#   Drag into /Applications
-
-# Option B: homebrew (if published)
-brew install --cask cuadriver
-
-# Verify
-/Applications/CuaDriver.app/Contents/MacOS/cua-driver --help
-```
-
-On first use macOS will prompt for Accessibility + Screen Recording permissions — grant them, they are required for native UI control.
-
-The extension auto-detects `/Applications/CuaDriver.app/Contents/MacOS/cua-driver`. Override with:
-
-```bash
-export CUA_DRIVER_BIN=/path/to/cua-driver
-```
-
-### web_cli → the `web` Chrome shim (bundled in this repo)
-
-`web_cli` does **not** use the cross-platform `agent-browser` npm CLI. It calls a custom bash shim that keeps a dedicated **Pi Automation** Chrome window and caches that window's exact Chrome tab ID plus native PID/window ID. Warm session DOM commands go directly through the persistent CuaDriver page daemon; AppleScript is used only for bootstrap/repair, explicit non-session tabs, and trusted foreground input. The shim is shipped at `scripts/web`.
-
-Install it onto your `PATH`:
-
-```bash
-# From the repo root
-mkdir -p ~/.local/bin
-cp scripts/web ~/.local/bin/web
-chmod +x ~/.local/bin/web
-# Ensure ~/.local/bin is on PATH (add to ~/.zshrc / ~/.bashrc if not)
-export PATH="$HOME/.local/bin:$PATH"
-
-# Verify
-web --help   # prints the QUICK START usage
-```
-
-The extension looks for `~/.local/bin/web` first, then falls back to `web` on `PATH`. Point it elsewhere with:
-
-```bash
-export WEB_CLI_PATH=/path/to/web
-```
-
-Requirements for the shim: **macOS**, **Google Chrome** installed, and **CuaDriver.app** present (the shim uses `cua-driver call page ...` for JavaScript execution and text extraction). Grant Chrome the same Accessibility permissions you gave CuaDriver.
-
-You also need Chrome logged into the account you want the agent to use. `web_cli` targets a persistent named **Pi Automation** window in your existing Chrome profile—it does **not** open a separate headless browser or adopt your active tab. Normal DOM operations remain background-safe while you use another Chrome window. Trusted clicks, real typing, and browser-gated controls may briefly foreground the exact automation tab, then restore the previous app/window/tab.
-
-On the development machine, caching the dedicated session target reduced warm `run`/`summary` command latency from roughly **618–645 ms to about 217 ms** (approximately **2.9–3× faster**). Cold start, target repair, page loading, and trusted input are not included in that microbenchmark.
-
----
-
-## 4. One-shot setup script
-
-```bash
-git clone https://github.com/MaxAutomize/LittleCua.git
-cd LittleCua
-./install.sh
-```
-
-`install.sh` checks for Node/Pi/the native binaries, installs Pi if missing, installs the bundled `web` shim to `~/.local/bin/web`, then runs `pi install` on the local checkout. It is idempotent — safe to re-run.
-
----
-
-## 5. Use it
-
-Start Pi and just ask — the model picks the right tool:
-
-- *"Take a screenshot of Xcode and click Run"* → `cua_driver`
-- *"Open github.com/my/repo and list the open issues"* → `web_cli`
-- *"In System Settings, turn on Developer Mode"* → `cua_driver` workflow sequence
-- *"Fill the login form on the site I'm on and submit"* → `web_cli` sequence
-
-### Direct visual feedback (v1.2)
-
-Screenshots and zoom results are delivered as actual images to vision-capable models, without a separate file-read call. Native action batches can optionally return one fresh screenshot of their exact target window:
+Native apps: inspect once if selectors must be discovered, then use a complete safe `sequence`, `parallel` for independent windows, or `program` for one JXA/AppleScript operation. Use `within` for repeated labels and exact PID/window IDs when appropriate. Refresh observations at real transitions, not after every stable field.
 
 ```json
 {
   "action": "workflow",
-  "screenshotAfter": true,
   "workflow": {
     "action": "sequence",
     "app": "Calculator",
-    "steps": [{ "action": "inspect", "query": "Calculator" }]
-  }
+    "observationPolicy": "fast",
+    "steps": [{"action": "inspect", "query": "Calculator"}]
+  },
+  "screenshotAfter": true
 }
 ```
 
-- `screenshotAfter` defaults to **false**, preserving the fast AX/DOM path. Use it when visual feedback matters.
-- Explicit target required; supported workflow actions are `inspect`, `act`, `sequence`, `launch`, and `activate`. Put program steps inside a sequence for program-plus-image results.
-- This is **on-demand screenshot capture, not continuous video recording**. macOS's Screen Recording permission also covers still screenshots.
-- Temporary capture files are always discarded; images remain in the Pi conversation. Explicit output paths are retained. Use `returnImage: false` with `screenshotOutFile`/`imageOut` for file-only delivery; implicit files are still discarded.
-- Missing/stale images are not attached. Post-action capture failure does not repeat completed actions.
-- Native clicks use AX to identify controls. `clickMode: "auto"` falls back to a fresh-frame mouse click for non-pressable controls; `mouse` forces that path and `ax` refuses fallback. Ambiguous, disabled, or materially moving bounds fail closed (a small WindowServer decoration correction is tolerated).
-- Native workflows use one end-to-end deadline and a bounded process-local coordinator: same-window work and pid-scoped mouse recipes cannot interleave, while safe independent exact-window reads remain parallel. No mutation is replayed after an ambiguous timeout/transport failure, and CuaDriver 0.1.4 exposes no OS-level human-intervention signal, so LittleCua does not claim one.
-- `fill` uses bounded mouse grounding followed by a fresh AX identity lookup and AX `set_value` for reliable replacement; focused `type_text` is still exercised separately for cleared-cell navigation.
-- Repeated native labels are safe by default: mutating selectors require `within` ancestor context or an explicit occurrence instead of silently selecting the first match.
-- `web_cli` click/click-text/type already target DOM controls directly; use trusted click/type only for custom inputs or gesture gates. Cua is not used for ordinary web DOM work.
+`screenshotAfter` optionally returns one fresh image in the same call. It is not continuous sight or recording. Keep it off for ordinary AX work. Screenshot failure never replays completed actions. Pixel coordinates are window-local screenshot pixels; don't divide for Retina or add a screen origin.
 
-This reduces screenshot → read from **two tool calls to one**, and workflow → screenshot → read from **three to one**. Local direct screenshot calls measured about **0.15 seconds**; no end-to-end task speedup percentage has been established. See [workflow documentation](extensions/cua-tool/NATIVE_WORKFLOW.md) for details.
+Chrome: use `web_cli`, not native AX traversal of webpage content. Use `nav` + `readAfter` for open-and-read, or a complete DOM `sequence`:
 
-### Tests
+```json
+{
+  "action": "sequence",
+  "steps": [
+    {"action": "click", "selector": "#next"},
+    {"action": "wait", "selector": "#nextStep", "waitState": "visible", "readAfter": "summary"}
+  ]
+}
+```
 
-With Pi installed globally, run from the repository root:
+`wait` supports selector, text, URL, enabled/hidden state and exact value. `foreground:true` shows the exact automation tab once at the endpoint through the Cua workflow. Normal DOM work stays background-safe. Trusted input may briefly take focus and restore it.
+
+## Repair is part of completing the workflow
+
+If a tool can't observe, target, type, dispatch, verify or continue reliably—or needs repeated unproductive calls—the task is **not finished**.
+
+1. Stop unchanged retries. Inspect the actual target, outcome and failure telemetry first.
+2. Distinguish missing dependencies/schema support from genuine permission, authentication, user-cancellation or external-outage blockers. Report blockers; don't bypass them.
+3. Repair/upgrade the **reusable** extension, shared workflow/native layer or browser shim. Consolidate common paths instead of accumulating app-specific hacks. Use the actual installed package path; don't assume the developer's `~/.pi/agent/extensions` layout.
+4. Add a focused regression for that exact failure; preserve working native input, exact targets, permission hooks and proven web/ALEKS paths.
+5. Regenerate DOM templates if the shim changed, validate, reload, then retest **through `cua_driver`/`web_cli`** from the preserved state.
+6. Report **dispatch separately from verified application success**. Never duplicate a send, purchase, submission, deletion or other possibly committed mutation.
+
+Both tools include this contract in their model-facing guidance. The shared repair guard blocks exact unchanged failed mutations within the loaded runtime; read-only diagnosis remains available. This is a safety guard plus agent instruction—not an unattended updater or a promise that every app can be repaired automatically. See [AGENTS.md](AGENTS.md).
+
+## Validation and upgrades
 
 ```bash
-npm test            # portable regression tests; no desktop access
-npm run test:fixture # self-owned temporary AppKit spreadsheet/form fixture + detailed report
-npm run test:live   # read-only Calculator captures; macOS + open Calculator required
-npm run test:business-inform # developer-informed UI-only business workflow trials (not blind model evaluation)
+npm test                 # all portable/mocked regressions + package/dependency checks
+npm run doctor           # read-only prerequisites; -- --json for structured output
+npm run generate:dom     # after editing bundled scripts/web; no browser actions
+bash -n install.sh scripts/web
 ```
 
-Tests reuse Pi's bundled loader/dependencies. For a non-global Pi installation, set `PI_PACKAGE_DIR` to its package directory. The fixture test owns a temporary AppKit process/windows, compares every expected cell/field through AX and an app-owned JSON oracle, restores the prior foreground app, and writes a detailed report under `~/Library/Application Support/LittleCua/reports/`. Live Calculator tests do not click or type. The fixture is not an Excel compatibility test.
+Tests use Pi's existing loader; set `PI_PACKAGE_DIR` for a non-global Pi installation. They don't need model credentials. On macOS, AppleScript compilation checks run without desktop mutation. Tests default to the **bundled** shim, not a developer's private installed version.
 
-### Environment variables
+Opt-in integration tests need an unlocked desktop and granted permissions:
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `CUA_DRIVER_BIN` | `/Applications/CuaDriver.app/Contents/MacOS/cua-driver` | Path to the CuaDriver binary |
-| `CUA_TOOL_TIMEOUT_MS` | `120000` | Per-call timeout for cua_driver |
-| `CUA_TOOL_MAX_OUTPUT_CHARS` | `12000` | Truncation limit for cua_driver output |
-| `WEB_CLI_PATH` | `~/.local/bin/web` → `web` | Path to the `web` browser CLI |
-
----
-
-## Repository layout
-
-```
-LittleCua/
-├── package.json                 # Pi package manifest (declares extensions)
-├── install.sh                   # One-command setup helper
-├── README.md
-├── scripts/
-│   └── web                      # macOS-only Chrome shim (AppleScript + cua-driver)
-└── extensions/
-    ├── cua-tool/
-    │   ├── index.ts              # cua_driver tool
-    │   ├── native-workflow-speed.ts # action: "workflow" implementation
-    │   ├── native-operation-coordinator.ts # bounded native deadline + local leases
-    │   ├── native-capabilities.ts # cached public installed-driver schema discovery
-    │   ├── native-pointer.ts      # bounded AX-bounds mouse fallback
-    │   ├── visual-results.ts      # inline images + optional post-batch capture
-    │   ├── tests/                 # regression, isolated fixtures, and read-only live smoke tests
-    │   ├── tests/business-fixture.swift # self-owned document-review workflow fixture
-    │   ├── tests/business-workflow-informed.mjs # UI-only semantic trial harness
-    │   ├── tests/business-grade.mjs # read-only objective oracle grader
-    │   ├── sitegeist-runtime.ts  # shared Sitegeist handoff runtime
-    │   └── NATIVE_WORKFLOW.md     # workflow docs
-    └── web-cli/
-        └── index.ts              # web_cli tool
+```bash
+PI_OFFLINE=1 npm run test:mcp-live       # self-owned AppKit fixture, real Pi MCP
+PI_OFFLINE=1 npm run test:web-live       # self-owned localhost Chrome fixture
+PI_OFFLINE=1 npm run test:readiness-live # delayed forms, redirect/focus identity
+npm run test:fixture                    # legacy fixture; CUA_TEST_NATIVE_MCP=1 for MCP
+npm run test:live                       # read-only capture; Calculator must be open
 ```
 
-The extensions are loaded via [jiti](https://github.com/unjs/jiti), so TypeScript runs directly — no build step.
+These fixtures are not universal Excel/Blender compatibility tests. Optional `blender-keyboard-live.mjs` additionally requires Blender and the separate Pi Blender extension/bridge; it is not included in `npm test`. Reports from opt-in fixtures go under `~/Library/Application Support/LittleCua/reports/`. Historic local timings in the implementation docs are not fresh release-test results or universal performance promises.
 
----
+For updates, save a checkpoint, update the Pi package checkout (`pi update --extensions` for managed installs, or `git pull --ff-only` for a clean local checkout), install the matching shim again, test and reload. Preserve any custom changes before replacing a shim. Never copy machine-local transport settings, credentials, caches or recordings into the repository.
 
-## Notes & requirements
+## Configuration
 
-- **macOS only** — `cua_driver` needs CuaDriver.app, and `web_cli` needs the bundled `web` shim which uses AppleScript + cua-driver. None of those exist on Windows/Linux. (The TypeScript extension code itself is cross-platform; only the runtimes it calls are macOS-bound.)
-- Node 18+.
-- Google Chrome installed.
-- Accessibility + Screen Recording permissions for CuaDriver (and Chrome, for the AppleScript path).
-- A Chrome profile logged into the accounts you want `web_cli` to use.
-- This package runs with full system access (all Pi extensions do). Review the source in `extensions/` and `scripts/web` before installing — it's short and readable.
+| Variable | Purpose |
+|---|---|
+| `CUA_DRIVER_BIN` | Driver override; otherwise app-bundle binary, then `cua-driver` on PATH |
+| `CUA_TOOL_TRANSPORT` / `WEB_TOOL_TRANSPORT` | `mcp` or explicit `cli`; overrides saved transport settings |
+| `CUA_TOOL_TIMEOUT_MS` | Cua default timeout (120000 ms) |
+| `CUA_TOOL_MAX_OUTPUT_CHARS` | Cua output cap (12000 characters) |
+| `WEB_CLI_PATH` | Matching browser shim override; normally `~/.local/bin/web`, then PATH |
+| `WEB_SESSION_FILE` / `WEB_SESSION_NAME` / `WEB_CACHE` | Shared browser target/lease locations and named automation window |
+| `WEB_SHOW_AGENT_CURSOR=1` | Explicit overlay opt-in for trusted browser compatibility input |
+| `PI_PACKAGE_DIR` | Pi installation directory for tests/doctor |
 
-## License
+## Source layout
 
-MIT
+- `extensions/cua-tool/`: workflow engine, MCP transport, exact native keyboard/window helpers, local OCR, inline images, tests and [workflow docs](extensions/cua-tool/NATIVE_WORKFLOW.md).
+- `extensions/web-cli/`: DOM MCP transport, target identity, shared lease, readiness/focus, generated templates, tests and [transport docs](extensions/web-cli/NATIVE_MCP.md).
+- `extensions/_shared/automation-repair.ts`: repair guidance and unchanged-failed-mutation guard.
+- `scripts/web`: matching macOS browser compatibility shim.
+- `scripts/doctor.mjs`, `scripts/test.mjs`, `install.sh`: dependency checks, regressions and explicit setup.
+
+Extensions run with your Pi process's system access. Review the source before loading it. **MIT licensed.**

@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { jiti } from './pi-loader.mjs';
 const {pixelCenter, clickNativeBounds}=await jiti.import('../native-pointer.ts');
 assert.deepEqual(pixelCenter({x:200,y:200,width:40,height:20},{x:100,y:100,width:400,height:200},{width:200,height:100}),{x:60,y:55});
+assert.deepEqual(pixelCenter({x:200,y:200,width:40,height:20},{x:100,y:100,width:400,height:200},{width:200,height:100},'trailing'),{x:66,y:55});
+assert.throws(()=>pixelCenter({x:200,y:200,width:40,height:20},{x:100,y:100,width:400,height:200},{width:200,height:100},'wrong'),/Unsupported/);
 assert.throws(()=>pixelCenter({x:0,y:0,width:0,height:1},{x:0,y:0,width:1,height:1},{width:1,height:1}),/empty/);
 const dir=mkdtempSync(join(tmpdir(),'cua-pointer-test-')), path=join(dir,'frame.png');
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAQAAACoWZgAAAAADUlEQVR42mNk+M/wHwAF/gL+K3c2AAAAAElFTkSuQmCC','base64');
@@ -15,6 +17,8 @@ try {
   const mode=await clickNativeBounds(pi,'cua-driver',call,{pid:7,windowId:8}, {role:'AXRow',line:'- AXRow (Sample) id=sample',label:'Sample'}, {}, undefined, 5000);
   assert.equal(mode,'mouse (AX bounds + fresh window frame)');
   assert.equal(calls.at(-1).tool,'click'); assert.equal(calls.at(-1).payload.x,3); assert.equal(calls.at(-1).payload.y,5.5);
+  await clickNativeBounds(pi,'cua-driver',call,{pid:7,windowId:8},{role:'AXStaticText',line:'- AXStaticText id=photo',label:''},{anchor:'trailing'},undefined,5000);
+  assert.equal(calls.at(-1).tool,'click'); assert.equal(calls.at(-1).payload.x,3.3); assert.equal(calls.at(-1).payload.y,5.5);
 } finally { rmSync(dir,{recursive:true,force:true}); }
 
 async function rejectsMovedTarget() {

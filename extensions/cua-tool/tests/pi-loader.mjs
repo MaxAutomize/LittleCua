@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
 
-const root = process.env.PI_PACKAGE_DIR || join(
+export const root = process.env.PI_PACKAGE_DIR || join(
   execFileSync('npm', ['root', '-g'], { encoding: 'utf8' }).trim(),
   '@earendil-works/pi-coding-agent',
 );
@@ -16,5 +16,6 @@ const require = createRequire(join(root, 'package.json'));
 const { createJiti } = require('jiti');
 export const jiti = createJiti(import.meta.url, { alias: {
   typebox: require.resolve('typebox'),
+  '@earendil-works/pi-coding-agent': join(root, 'dist/index.js'),
   '@earendil-works/pi-ai': join(root, 'node_modules/@earendil-works/pi-ai/dist/index.js'),
 } });

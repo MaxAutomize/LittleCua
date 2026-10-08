@@ -2,7 +2,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 import { clickNativeBounds } from "./native-pointer.ts";
+import { characterScript, focusedKeyboardScript, keyboardWindowIdentifier, nativeCharacterKeyCode } from "./native-keyboard.ts";
+import { supplementElevatedNativeWindows } from "./native-window-catalog.ts";
+import { selectNativeVisionText } from "./native-vision-click.ts";
 import {
   NativeDeadline,
   NativeOperationError,
@@ -12,17 +20,18 @@ import {
   scopedNativeDeadline,
   targetOperationKeys,
 } from "./native-operation-coordinator.ts";
-import { discoverNativeDriverCapabilities, requireNativeCapability, type NativeDriverCapabilities } from "./native-capabilities.ts";
+import { discoverNativeDriverCapabilities, requireNativeCapability, nativeScopedPayload, nativeClickAction, type NativeDriverCapabilities } from "./native-capabilities.ts";
 
-const BIN = process.env.CUA_DRIVER_BIN ?? "cua-driver";
+const BIN = process.env.CUA_DRIVER_BIN ?? (existsSync("/Applications/CuaDriver.app/Contents/MacOS/cua-driver") ? "/Applications/CuaDriver.app/Contents/MacOS/cua-driver" : "cua-driver");
 const DEFAULT_TIMEOUT_MS = Number(process.env.NATIVE_FAST_TIMEOUT_MS ?? 15_000);
 const CACHE_TTL_MS = Number(process.env.NATIVE_FAST_CACHE_TTL_MS ?? 300_000);
 const MAX_TREE_CHARS = Number(process.env.NATIVE_FAST_MAX_TREE_CHARS ?? 8_000);
+const NATIVE_VISION_OCR = fileURLToPath(new URL('./native-vision-ocr.swift', import.meta.url));
 
 const stepSchema = Type.Object({
   action: StringEnum([
     "inspect", "click", "double_click", "right_click", "type", "fill", "set_value",
-    "press_key", "hotkey", "scroll", "wait", "activate", "pixel_click", "drag", "raw_call", "applescript", "program",
+    "press_key", "hotkey", "scroll", "wait", "activate", "pixel_click", "vision_click", "drag", "raw_call", "applescript", "program",
   ] as const),
   query: Type.Optional(Type.String({ description: "Case-insensitive text used to find an AX element. Omit for unlabeled controls when role is supplied." })),
   within: Type.Optional(Type.String({ description: "Optional case-insensitive ancestor heading/panel context. Use with duplicate labels such as Edit, Continue, Review, or Save; never guesses a sibling." })),
@@ -30,7 +39,8 @@ const stepSchema = Type.Object({
   occurrence: Type.Optional(Type.Integer({ minimum: 1, description: "1-based match when query finds multiple elements. Defaults to 1." })),
   exact: Type.Optional(Type.Boolean({ description: "Prefer an exact accessible label/value match rather than substring matching." })),
   allowDisabled: Type.Optional(Type.Boolean()),
-  clickMode: Type.Optional(StringEnum(["auto", "mouse", "ax"] as const, { description: "Native click routing: auto uses supported AXPress with bounded mouse fallback; mouse uses AX bounds plus a fresh frame; ax never falls back. Mouse requires an unambiguous visible target." })),
+  clickMode: Type.Optional(StringEnum(["auto", "mouse", "ax"] as const, { description: "Native click routing: auto uses supported AX actions with bounded mouse fallback; mouse uses AX bounds plus a fresh frame; ax never falls back. Mouse requires an unambiguous visible target." })),
+  clickAnchor: Type.Optional(StringEnum(["center", "trailing"] as const, { description: "Explicit mouse click position within fresh AX bounds. Use trailing for an AX-invisible dropdown arrow in a composite native control; requires clickMode=mouse." })),
   text: Type.Optional(Type.String({ description: "Text for type/fill." })),
   value: Type.Optional(Type.String({ description: "Value for set_value." })),
   key: Type.Optional(Type.String({ description: "Key for press_key, e.g. return, tab, escape." })),
@@ -54,6 +64,7 @@ const stepSchema = Type.Object({
   durationMs: Type.Optional(Type.Number({ minimum: 0 })),
   fromZoom: Type.Optional(Type.Boolean({ description: "True only when pixel coordinates came from the last zoom image." })),
   debugImageOut: Type.Optional(Type.String({ description: "Optional debug PNG showing the received pixel-click crosshair." })),
+  expectWindowClosed: Type.Optional(Type.Boolean({ description: "For vision_click, require this exact window to disappear after dispatch; no mutation is retried." })),
   fresh: Type.Optional(Type.Boolean({ description: "Force a fresh AX observation before this step. Normally unnecessary; waits and errors refresh automatically." })),
   verify: Type.Optional(Type.String({ description: "After this step, return AX state filtered to this text." })),
 });
@@ -90,10 +101,11 @@ export const nativeFastSchema = Type.Object({
   exact: Type.Optional(Type.Boolean()),
   allowDisabled: Type.Optional(Type.Boolean()),
   clickMode: Type.Optional(StringEnum(["auto", "mouse", "ax"] as const)),
+  clickAnchor: Type.Optional(StringEnum(["center", "trailing"] as const)),
   stepAction: Type.Optional(StringEnum([
     "inspect", "click", "double_click", "right_click", "type", "fill", "set_value",
-    "press_key", "hotkey", "scroll", "wait", "activate", "pixel_click", "drag", "raw_call", "applescript", "program",
-  ] as const, { description: "Operation for action=act." })),
+    "press_key", "hotkey", "scroll", "wait", "activate", "pixel_click", "vision_click", "drag", "raw_call", "applescript", "program",
+  ] as const, { description: "Operation for action=act. vision_click is an explicit OCR fallback for a button missing from AX; it requires query and within." })),
   text: Type.Optional(Type.String()),
   value: Type.Optional(Type.String()),
   key: Type.Optional(Type.String()),
@@ -117,6 +129,7 @@ export const nativeFastSchema = Type.Object({
   durationMs: Type.Optional(Type.Number({ minimum: 0 })),
   fromZoom: Type.Optional(Type.Boolean({ description: "True only when x/y came from the last zoom image; full screenshot coordinates need no scaling." })),
   debugImageOut: Type.Optional(Type.String({ description: "Optional debug PNG showing the received pixel-click crosshair." })),
+  expectWindowClosed: Type.Optional(Type.Boolean({ description: "For vision_click, verify the exact window disappears in this call. Never repeat a potentially dispatched click." })),
   verify: Type.Optional(Type.String({ description: "Optional final AX query. Skip routine verification; use only when the endpoint is consequential or uncertain." })),
   observationPolicy: Type.Optional(StringEnum(["fast", "adaptive", "strict"] as const, { description: "fast (default) reuses one AX observation across a batch and refreshes on waits/misses; adaptive refreshes after likely state changes; strict refreshes every semantic action." })),
   responseMode: Type.Optional(StringEnum(["compact", "detailed"] as const, { description: "compact (default) returns one summary; detailed includes every step." })),
@@ -463,6 +476,7 @@ export default function nativeFastExtension(pi: ExtensionAPI) {
   };
 
   const ensureDaemon = async (signal?: AbortSignal) => {
+    if (await (pi as any).cuaMcpReady?.(signal)) return;
     if (daemonReady) return;
     const status = await pi.exec(BIN, ["status"], { signal, timeout: currentDeadline("cua-driver status", signal, 3_000) });
     if (status.code !== 0) {
@@ -531,6 +545,10 @@ export default function nativeFastExtension(pi: ExtensionAPI) {
     if (params.pid !== undefined) candidates = candidates.filter((window) => window.pid === params.pid);
     if (params.windowId !== undefined) candidates = candidates.filter((window) => window.window_id === params.windowId);
     let chosen = chooseWindow(candidates, params.app, params.windowTitle, params.windowOccurrence ?? 1);
+    if (!chosen && params.windowTitle) {
+      candidates = await supplementElevatedNativeWindows(pi, candidates, params.pid, signal, currentNativeDeadline());
+      chosen = chooseWindow(candidates, params.app, params.windowTitle, params.windowOccurrence ?? 1);
+    }
 
     if (!chosen && (params.launchIfNeeded ?? Boolean(params.app || params.bundleId))) {
       const target = await launch(params, signal);
@@ -621,7 +639,7 @@ if appName contains "Chrome" then
   end tell
 else
   tell application "System Events"
-    set targetProcess to first application process whose unix id is targetPid
+    set targetProcess to a reference to (first application process whose unix id is targetPid)
     try
       repeat with w in windows of targetProcess
         if targetTitle is not "" and (name of w as text) contains targetTitle then
@@ -635,7 +653,7 @@ else
   end tell
 end if
 tell application "System Events"
-  set targetProcess to first application process whose unix id is targetPid
+  set targetProcess to a reference to (first application process whose unix id is targetPid)
   set frontmost of targetProcess to true
 end tell
 end run`;
@@ -660,7 +678,27 @@ end run`;
   const sendHotkey = async (target: Target, keys: string[] | undefined, signal?: AbortSignal, timeoutMs = DEFAULT_TIMEOUT_MS) => {
     if (!keys?.length) throw new Error("hotkey requires keys.");
     const normalized = keys.map((key) => key.toLowerCase());
-    const keyCode = punctuationKeyCodes[normalized[normalized.length - 1]];
+    const last = normalized[normalized.length - 1];
+    const functionKeyCodes: Record<string, number> = { f1:122, f2:120, f3:99, f4:118, f5:96, f6:97, f7:98, f8:100, f9:101, f10:109, f11:103, f12:111 };
+    let owner = target.appName;
+    if (functionKeyCodes[last] !== undefined && !owner) {
+      const windows = await call("list_windows", { pid: target.pid, on_screen_only: true }, signal, timeoutMs);
+      const exact = windows.data?.windows?.find((w: any) => w.window_id === target.windowId);
+      if (!exact) throw new Error("Exact function-shortcut window is unavailable; no key dispatched.");
+      owner = String(exact.app_name || "");
+      target = { ...target, appName: owner, title: String(exact.title || target.title) };
+    }
+    // Blender's event system can interpret postToPid Shift+Fn as plain Fn. Use
+    // the established real System Events path, preserving exact PID and focus.
+    let keyCode = punctuationKeyCodes[last] ?? (owner === "Blender" ? functionKeyCodes[last] : undefined);
+    let keyboardState: Awaited<ReturnType<typeof snapshot>> | undefined;
+    if (keyCode === undefined && normalized.length > 1 && nativeCharacterKeyCode(last) !== undefined) {
+      keyboardState = await snapshot(target, undefined, signal, timeoutMs);
+      // AppKit file panels can ignore postToPid key equivalents even though the
+      // driver reports dispatch. Use the same exact-window real keyboard route.
+      if (/^(open|save)-panel$/.test(keyboardWindowIdentifier(keyboardState.fullMarkdown)))
+        keyCode = nativeCharacterKeyCode(last);
+    }
     if (keyCode === undefined) {
       await call("hotkey", { pid: target.pid, window_id: target.windowId, keys }, signal, timeoutMs);
       return;
@@ -672,38 +710,12 @@ end run`;
       ctrl: "control down", control: "control down",
     };
     const modifiers = normalized.slice(0, -1).map((modifier) => modifierMap[modifier]);
-    if (modifiers.some((modifier) => !modifier)) throw new Error(`Unsupported punctuation-hotkey modifier in ${keys.join("+")}.`);
+    if (modifiers.some((modifier) => !modifier)) throw new Error(`Unsupported real-keyboard modifier in ${keys.join("+") }.`);
     const usingClause = modifiers.length ? ` using {${modifiers.join(", ")}}` : "";
-    const script = `on run argv
-set targetPid to (item 1 of argv) as integer
-set targetTitle to item 2 of argv
-set priorPid to 0
-tell application "System Events"
-  try
-    set priorPid to unix id of first application process whose frontmost is true
-  end try
-  set targetProcess to first application process whose unix id is targetPid
-  try
-    repeat with w in windows of targetProcess
-      if targetTitle is not "" and (name of w as text) contains targetTitle then
-        try
-          perform action "AXRaise" of w
-        end try
-        exit repeat
-      end if
-    end repeat
-  end try
-  set frontmost of targetProcess to true
-  key code ${keyCode}${usingClause}
-  delay 0.05
-  if priorPid is not 0 and priorPid is not targetPid then
-    try
-      set frontmost of first application process whose unix id is priorPid to true
-    end try
-  end if
-end tell
-end run`;
-    const result = await pi.exec("/usr/bin/osascript", ["-e", script, String(target.pid), target.title], { signal, timeout: currentDeadline("native hotkey", signal, timeoutMs) });
+    const state = keyboardState ?? await snapshot(target, undefined, signal, timeoutMs);
+    const identifier = keyboardWindowIdentifier(state.fullMarkdown);
+    const script = focusedKeyboardScript(`    key code ${keyCode}${usingClause}\n    delay 0.15`);
+    const result = await pi.exec("/usr/bin/osascript", ["-e", script, String(target.pid), target.title, identifier], { signal, timeout: currentDeadline("native hotkey", signal, timeoutMs) });
     if (result.code !== 0) throw new Error(`hotkey failed: ${result.stderr || result.stdout}`);
   };
 
@@ -734,7 +746,25 @@ end run`;
           }
           await nativeDelay(100, signal, currentNativeDeadline(), "native readiness wait");
         } while (Date.now() < waitDeadline);
-        throw new NativeOperationError("timeout", `Timed out after ${ms}ms waiting for native control: ${lastError}`, {
+        // A shortcut may open a separate Preferences/document window. Never silently
+        // move a pinned workflow there, but identify the handoff instead of suggesting
+        // retries against the old window (Terminal cmd+, is a common example).
+        let handoff = "";
+        try {
+          const listed = await listWindows(signal, timeoutMs, target.pid);
+          const candidates = listed.windows.filter((window) => window.pid === target.pid && window.window_id !== target.windowId && window.is_on_screen);
+          const matches: WindowRecord[] = [];
+          for (const window of candidates) {
+            const other = { ...target, windowId: window.window_id!, title: String(window.title ?? "") };
+            const state = await snapshot(other, undefined, signal, timeoutMs);
+            try { selectElement(state.fullMarkdown, step); matches.push(window); } catch { /* not the requested control */ }
+          }
+          if (matches.length === 1) {
+            const window = matches[0];
+            handoff = ` The control is in a different window: ${JSON.stringify(window.title ?? "")} (pid=${target.pid}, windowId=${window.window_id}). Continue with that explicit windowId; do not repeat the opening shortcut. The original workflow remains pinned to windowId=${target.windowId}.`;
+          }
+        } catch { /* Keep the original failure if discovery itself is unavailable. */ }
+        throw new NativeOperationError("timeout", `Timed out after ${ms}ms waiting for native control: ${lastError}.${handoff}`, {
           phase: "native readiness wait", deadlineUnixMilliseconds: currentNativeDeadline().deadlineUnixMilliseconds,
         });
       }
@@ -760,10 +790,95 @@ end run`;
 
     if (step.action === "raw_call") {
       if (!step.tool) throw new Error("raw_call requires tool.");
-      const payload = { pid: target.pid, window_id: target.windowId, ...(step.payload ?? {}) };
+      // type_text_chars is Pi's ordered keyboard operation, not a driver/MCP
+      // capability. Route before driver schema/capability discovery; never retry
+      // after dispatch or send the commit key through a separate input stream.
+      if (step.tool === "type_text_chars") {
+        const p = step.payload ?? {};
+        const beforeDispatch = (message: string) => new NativeOperationError('failed',message,{phase:'ordered workflow typing',dispatchState:'not-dispatched',deadlineUnixMilliseconds:currentNativeDeadline().deadlineUnixMilliseconds});
+        if ((p.pid !== undefined && p.pid !== target.pid) || (p.window_id !== undefined && p.window_id !== target.windowId) || (p.windowId !== undefined && p.windowId !== target.windowId))
+          throw beforeDispatch('Ordered typing payload cannot override the exact workflow target; no input dispatched.');
+        if (typeof p.text !== 'string') throw beforeDispatch('Ordered typing requires text; no input dispatched.');
+        const delayMs = p.delay_ms ?? p.delayMs ?? step.delayMs ?? 3;
+        if (typeof delayMs !== 'number' || !Number.isFinite(delayMs) || delayMs < 1 || delayMs > 200)
+          throw beforeDispatch('Ordered typing delay must be1..200ms; no input dispatched.');
+        const commits: Record<string,number> = {return:36,enter:36,tab:48,escape:53,esc:53};
+        const key = typeof p.key === 'string' ? p.key.toLowerCase() : undefined;
+        if (p.key !== undefined && (!key || commits[key] === undefined)) throw beforeDispatch('Ordered typing commit must be return,tab or escape; no input dispatched.');
+        const state = await snapshot(target, undefined, signal, timeoutMs);
+        const identifier = keyboardWindowIdentifier(state.fullMarkdown);
+        let title = target.title;
+        if (!identifier && !title) {
+          const windows = await listWindows(signal, timeoutMs, target.pid);
+          const exact = windows.windows.find(w => w.window_id === target.windowId);
+          if (!exact) throw beforeDispatch('Exact ordered-typing window disappeared; no input dispatched.');
+          title = String(exact.title ?? '');
+        }
+        const result = await pi.exec('/usr/bin/osascript', ['-e', characterScript(), String(target.pid), title, p.text, String(delayMs/1000), String(key ? commits[key] : -1), identifier], { signal, timeout: currentDeadline('ordered workflow typing', signal, timeoutMs) });
+        observation.dirty = true;
+        if (result.code !== 0) throw new NativeOperationError('failed', `${result.stderr || result.stdout || 'Ordered typing failed'}; partial input/commit may exist. Inspect before retrying.`, {phase:'ordered workflow typing',dispatchState:'possibly-dispatched',deadlineUnixMilliseconds:currentNativeDeadline().deadlineUnixMilliseconds});
+        return {summary:`Dispatched ${p.text.length} characters${key ? ' and '+key : ''} in one ordered transaction to PID${target.pid}; application outcome not yet verified.`,elapsedMs:performance.now()-started,dispatchState:'dispatch-only'};
+      }
+      const payload = nativeScopedPayload(driverCapabilities!, step.tool, target, step.payload ?? {});
       const result = await call(step.tool, payload, signal, timeoutMs);
       observation.dirty = true;
       return { summary: `raw ${step.tool}: ${compact(result.raw || "ok", 2_000)}`, elapsedMs: performance.now() - started, dispatchState: "dispatch-only" };
+    }
+
+    if (step.action === "vision_click") {
+      // Explicit OCR fallback for owner-drawn native dialogs whose button text
+      // is absent from AX. One fresh exact-window screenshot, one unique exact
+      // text match plus dialog context, and at most ONE click. Never guess from
+      // a screenshot captured in a previous tool/model turn.
+      const phase = 'native vision_click';
+      const predispatch = (message: string) => new NativeOperationError('failed', message, {
+        phase, deadlineUnixMilliseconds: currentNativeDeadline().deadlineUnixMilliseconds,
+        dispatchState: 'not-dispatched',
+      });
+      if (!step.query?.trim() || !step.within?.trim()) throw predispatch('vision_click requires query and visible dialog context within. No click dispatched.');
+      if (step.fromZoom) throw predispatch('vision_click captures its own full-window screenshot; fromZoom is unsupported. No click dispatched.');
+      requireNativeCapability(driverCapabilities!, Boolean(driverCapabilities?.summary.pixelClick && driverCapabilities?.summary.windowScreenshot),
+        'Native vision_click requires public window screenshot and click(x,y) support.', phase);
+      const dir = await mkdtemp(join(tmpdir(), 'pi-native-vision-'));
+      try {
+        const screenshotPath = join(dir, 'window.png');
+        const capture = await pi.exec(BIN, ['call', 'screenshot', JSON.stringify({ window_id: target.windowId, format: 'png' }),
+          '--screenshot-out-file', screenshotPath, '--compact'], { signal, timeout: currentDeadline('native vision screenshot', signal, timeoutMs) });
+        if (capture.code !== 0) throw predispatch(`Window capture failed: ${capture.stderr || capture.stdout || capture.code}. No click dispatched.`);
+        const bytes = await readFile(screenshotPath);
+        if (bytes.length < 24 || bytes.subarray(1, 4).toString('ascii') !== 'PNG')
+          throw predispatch('Window capture did not produce a PNG. No click dispatched.');
+        const recognized = await pi.exec('/usr/bin/swift', [NATIVE_VISION_OCR, screenshotPath], {
+          signal, timeout: currentDeadline('native Vision OCR', signal, timeoutMs),
+        });
+        if (recognized.code !== 0) throw predispatch(`Native Vision OCR failed: ${recognized.stderr || recognized.stdout || recognized.code}. No click dispatched.`);
+        let snapshot;
+        try { snapshot = JSON.parse(recognized.stdout); }
+        catch { throw predispatch('Native Vision OCR returned invalid JSON. No click dispatched.'); }
+        let point;
+        try { point = selectNativeVisionText(snapshot, step.query, step.within, step.occurrence); }
+        catch (error) { throw predispatch(error instanceof Error ? error.message : String(error)); }
+        const windows = await listWindows(signal, timeoutMs, target.pid);
+        if (!windows.windows.some(window => window.pid === target.pid && window.window_id === target.windowId && window.is_on_screen))
+          throw predispatch('The exact native window changed/disappeared before the OCR click. No click dispatched.');
+        await call('click', { pid: target.pid, window_id: target.windowId, x: point.x, y: point.y, count: 1 }, signal, timeoutMs);
+        markObservationDirty(observation);
+        if (step.expectWindowClosed) {
+          const until = Math.min(Date.now() + (step.waitMs ?? 2_500), currentNativeDeadline().deadlineUnixMilliseconds);
+          let closed = false;
+          do {
+            const listed = await listWindows(signal, timeoutMs, target.pid);
+            closed = !listed.windows.some(window => window.pid === target.pid && window.window_id === target.windowId);
+            if (closed) break;
+            await nativeDelay(100, signal, currentNativeDeadline(), 'vision click close verification');
+          } while (Date.now() < until);
+          if (!closed) throw new NativeOperationError('failed', `Visible button “${step.query}” was clicked, but the exact window did not close. Inspect before any retry.`, {
+            phase, deadlineUnixMilliseconds: currentNativeDeadline().deadlineUnixMilliseconds, dispatchState: 'possibly-dispatched',
+          });
+        }
+        return { summary: `vision-clicked exact “${step.query}” in “${step.within}” at (${point.x}, ${point.y}), confidence ${point.confidence.toFixed(2)}${step.expectWindowClosed ? '; exact window closed' : ''}`,
+          elapsedMs: performance.now() - started, dispatchState: step.expectWindowClosed ? 'verified' : 'dispatch-only' };
+      } finally { await rm(dir, { recursive: true, force: true }); }
     }
 
     if (step.action === "pixel_click") {
@@ -818,14 +933,17 @@ end run`;
       const clickSelected = async () => {
           // Standard pressable roles omit AXPress in the driver's compact tree.
           // Never send AXPress to rows/labels merely because they are indexed.
-          const pressable = element.index >= 0 && (/actions=\[[^\]]*\bAXPress\b/.test(element.line)
+          if (step.clickAnchor === 'trailing' && step.clickMode !== 'mouse')
+            throw new Error('Trailing native click anchor requires explicit clickMode=mouse; no click dispatched');
+          const axAction = nativeClickAction(element.role, element.line, Boolean(driverCapabilities?.supports('click', 'action')));
+          const pressable = element.index >= 0 && (axAction !== 'press' || /actions=\[[^\]]*\bAXPress\b/.test(element.line)
             || ['AXButton', 'AXCheckBox', 'AXRadioButton', 'AXPopUpButton', 'AXLink'].includes(element.role));
-          let mode = 'AXPress';
+          let mode = axAction === 'pick' ? 'AXPick' : axAction === 'show_menu' ? 'AXShowMenu' : 'AXPress';
           const mouse = async () => {
             try {
               requireNativeCapability(driverCapabilities!, Boolean(driverCapabilities?.summary.pixelClick && driverCapabilities?.summary.windowScreenshot), "Native mouse fallback needs public click(x,y) and screenshot(window_id) support.", "native mouse fallback");
               return await clickNativeBounds(pi, BIN, call, target, selected.chosen,
-                { count: step.count, modifiers: step.modifiers }, signal, currentNativeDeadline());
+                { count: step.count, modifiers: step.modifiers, anchor: step.clickAnchor }, signal, currentNativeDeadline());
             } finally {
               observation.fullMarkdown = undefined;
               observation.dirty = true;
@@ -838,7 +956,7 @@ end run`;
           if (step.clickMode === 'mouse' || (step.clickMode !== 'ax' && (!pressable || step.modifiers?.length || (step.count ?? 1) !== 1))) {
             mode = await mouse();
           } else {
-            try { await call("click", base, signal, timeoutMs); }
+            try { await call("click", axAction === 'press' ? base : { ...base, action: axAction }, signal, timeoutMs); }
             catch (error) {
               // Only a definite unsupported action is safe to retry by mouse.
               // Timeouts/transport errors might already have dispatched a click.
@@ -939,7 +1057,7 @@ end run`;
     promptSnippet: "Speed-first native Mac control: one-call action batches, shared AX observations, concurrent independent windows, compact results.",
     promptGuidelines: [
       "Use the integrated Cua workflow as the primary path for native Mac automation; send the largest safe same-window action batch in one sequence.",
-      "Prefer action=program for a fully codeable flow; otherwise use one sequence with observationPolicy=fast so controls are resolved from one shared AX observation and refreshed only on waits or selector misses.",
+      "For simple native window foregrounding, use action=activate with the exact PID/windowId instead of hand-writing a program. For the automation browser use web_cli action=focus or foreground=true; its shared native helper compares Chrome window/tab IDs as text because Chrome AppleScript IDs that look numeric are strings. Otherwise prefer action=program for a fully codeable flow, or one sequence with observationPolicy=fast and refresh only on waits or selector misses.",
       "Use action=parallel with tasks when two or more target windows are independent; keep all mutations for the same window in one ordered task.",
       "Do not issue a separate inspect after a successful Cua sequence. Trust successful action results and request final verify only for consequential endpoints, ambiguity, or an explicit user request.",
       "Put a readiness wait only at a real UI transition such as opening a sheet; do not wait or re-observe between stable form fields and controls.",
@@ -992,7 +1110,8 @@ end run`;
             timings.list_windows.push(performance.now() - tick);
           }
           const median = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
-          const text = `cua-driver daemon: ready\nstatus median: ${median(timings.status).toFixed(1)}ms\nlist_windows median: ${median(timings.list_windows).toFixed(1)}ms\nCua workflow cache entries: ${targetCache.size}`;
+          const nativeMcp = await (pi as any).cuaMcpReady?.(signal);
+          const text = `cua-driver ${nativeMcp ? "native MCP" : "daemon"}: ready\nstatus median: ${median(timings.status).toFixed(1)}ms\nlist_windows median: ${median(timings.list_windows).toFixed(1)}ms\nCua workflow cache entries: ${targetCache.size}`;
           return { content: [{ type: "text", text }], details: { timings, elapsedMs: performance.now() - started } };
         }
 
@@ -1006,6 +1125,7 @@ end run`;
 
         if (params.action === "windows") {
           const listed = await listWindows(signal, timeoutMs, params.pid);
+          listed.windows = await supplementElevatedNativeWindows(pi, listed.windows, params.pid, signal, currentNativeDeadline());
           const needle = params.app?.toLowerCase();
           const titleNeedle = params.windowTitle?.toLowerCase();
           const windows = listed.windows.filter((window) =>
@@ -1097,6 +1217,7 @@ end run`;
             exact: params.exact,
             allowDisabled: params.allowDisabled,
             clickMode: params.clickMode,
+            clickAnchor: params.clickAnchor,
             text: params.text,
             value: params.value,
             key: params.key,
@@ -1120,6 +1241,7 @@ end run`;
             durationMs: params.durationMs,
             fromZoom: params.fromZoom,
             debugImageOut: params.debugImageOut,
+            expectWindowClosed: params.expectWindowClosed,
             verify: params.action === "act" ? params.verify : undefined,
           };
           const steps = params.action === "sequence" ? (params.steps ?? []) : [topStep];

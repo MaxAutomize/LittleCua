@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import {jiti} from './pi-loader.mjs';
+const {default:extension}=await jiti.import('../native-workflow-speed.ts');
+let tool;const calls=[];
+const names=['list_windows','hotkey','get_window_state'];
+const pi={registerTool:t=>tool=t,registerCommand(){},on(){},async exec(bin,args){calls.push({bin,args});if(args[0]==='dump-docs')return{code:0,stdout:JSON.stringify({mcp:{version:'fixture',tools:names.map(name=>({name,input_schema:{properties:{pid:{},window_id:{},keys:{}}}}))}}),stderr:''};if(args[0]==='status')return{code:0,stdout:'ready',stderr:''};if(args[0]==='call')return{code:0,stdout:JSON.stringify(args[1]==='list_windows'?{windows:[{pid:77,window_id:88,app_name:'Blender',title:'Fixture'}]}:{ok:true}),stderr:''};if(bin==='/usr/bin/osascript')return{code:0,stdout:'',stderr:''};throw new Error('Unexpected invocation')}};
+extension(pi);
+await tool.execute('modified-f4',{action:'act',pid:77,windowId:88,stepAction:'hotkey',keys:['shift','f4']});
+assert.equal(calls.filter(c=>c.args[0]==='call'&&c.args[1]==='hotkey').length,0,'Blender must not receive the postToPid path that drops modifiers');
+const script=calls.find(c=>c.bin==='/usr/bin/osascript');assert.ok(script);assert.match(script.args[1],/key code 118 using \{shift down\}/);assert.ok(script.args.includes('77'));assert.ok(script.args.includes('Fixture'));assert.match(script.args[1],/priorPid/);assert.match(script.args[1],/set targetProcess to a reference to \(first application process whose unix id is targetPid\)/,'retain PID predicate instead of resolving duplicate app names');assert.match(script.args[1],/if not \(frontmost of targetProcess\) then error/,'fail before key dispatch if exact PID did not activate');
+calls.length=0;
+await tool.execute('other-app',{action:'act',pid:77,windowId:88,app:'Other App',stepAction:'hotkey',keys:['shift','f4']});assert.equal(calls.filter(c=>c.args[0]==='call'&&c.args[1]==='hotkey').length,1);assert.equal(calls.filter(c=>c.bin==='/usr/bin/osascript').length,0);
+console.log('PASS Blender modified function keys use real exact-PID System Events; other apps retain native MCP routing');

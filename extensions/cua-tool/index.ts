@@ -4,10 +4,27 @@ import { Type, type Static } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import nativeWorkflowExtension, { nativeFastSchema } from "./native-workflow-speed.ts";
 import { withVisualResults } from "./visual-results.ts";
+import { typeNativeCharacters, keyboardWindowIdentifier } from "./native-keyboard.ts";
+import { createNativeMcpTransport } from "./native-mcp-transport.ts";
+import { withAutomationRepair } from "../_shared/automation-repair.ts";
+import { supplementElevatedNativeWindows } from "./native-window-catalog.ts";
+import { NativeDeadline } from "./native-operation-coordinator.ts";
+import { fileURLToPath } from "node:url";
 
 const CUA_TIMEOUT_MS = Number(process.env.CUA_TOOL_TIMEOUT_MS ?? 120_000);
 const CUA_DRIVER_BIN = process.env.CUA_DRIVER_BIN ?? (existsSync("/Applications/CuaDriver.app/Contents/MacOS/cua-driver") ? "/Applications/CuaDriver.app/Contents/MacOS/cua-driver" : "cua-driver");
 const stringArray = Type.Optional(Type.Array(Type.String(), { description: "Extra literal CLI arguments appended at the end. Use for new Cua CLI flags not yet modeled." }));
+
+const CUA_BOTTLENECK_RECOVERY =
+  `cua_driver bottleneck: inspect the exact AX/native-app failure and telemetry; update ${fileURLToPath(import.meta.url)} or the integrated workflow/native driver layer as appropriate; preserve proven paths; validate; call reload_runtime(mode='continue'); then retry the original operation from the same app state.`;
+
+function addCuaRecovery(result: any): any {
+  if (!result?.isError) return result;
+  const alreadyIncluded = result.content?.some((item: any) => item?.type === "text" && String(item.text).includes("cua_driver bottleneck:"));
+  if (!alreadyIncluded) result.content = [...(result.content || []), { type: "text", text: CUA_BOTTLENECK_RECOVERY }];
+  result.details = { ...(result.details || {}), recovery: CUA_BOTTLENECK_RECOVERY };
+  return result;
+}
 
 function need(value: unknown, name: string): string {
   if (value === undefined || value === null || value === "") throw new Error(`Missing required parameter: ${name}`);
@@ -96,7 +113,8 @@ function writeTempJson(prefix: string, data: unknown): string | undefined {
 async function run(pi: ExtensionAPI, command: string, args: string[], signal: AbortSignal | undefined, timeoutMs?: number, onUpdate?: (partial: any) => void) {
   const execCommand = command;
   const execArgs = args;
-  onUpdate?.({ content: [{ type: "text", text: `${execCommand} ${execArgs.map((a) => JSON.stringify(a)).join(" ")}` }] });
+  const nativeCall = (pi as any).cuaTransportMode?.() === "mcp" && /(^|\/)cua-driver$/.test(command) && args[0] === "call";
+  onUpdate?.({ content: [{ type: "text", text: nativeCall ? `Native MCP cua_native/${args[1]}…` : `${execCommand} ${execArgs.map((a) => JSON.stringify(a)).join(" ")}` }] });
   const result = await pi.exec(execCommand, execArgs, { signal, timeout: timeoutMs ?? CUA_TIMEOUT_MS });
   const stdout = result.stdout?.trim() ?? "";
   const stderr = cleanCuaStderr(result.stderr?.trim() ?? "");
@@ -104,11 +122,12 @@ async function run(pi: ExtensionAPI, command: string, args: string[], signal: Ab
   return {
     isError: result.code !== 0,
     content: [{ type: "text" as const, text }],
-    details: { command: execCommand, args: execArgs, requestedCommand: command, requestedArgs: args, code: result.code, killed: result.killed, stdout, stderr },
+    details: { command: nativeCall ? `native-mcp:cua_native/${args[1]}` : execCommand, args: execArgs, requestedCommand: command, requestedArgs: args, code: result.code, killed: result.killed, stdout, stderr },
   };
 }
 
 async function ensureCuaDriverDaemon(pi: ExtensionAPI, signal: AbortSignal | undefined) {
+  if (await (pi as any).cuaMcpReady?.(signal)) return;
   const status = await pi.exec(CUA_DRIVER_BIN, ["status"], { signal, timeout: 10_000 });
   if (status.code === 0) return;
   await pi.exec("open", ["-n", "-g", "-a", "CuaDriver", "--args", "serve"], { signal, timeout: 10_000 });
@@ -155,10 +174,10 @@ const driverSchema = Type.Object({
   button: Type.Optional(StringEnum(["left", "right", "middle"] as const)),
   durationMs: Type.Optional(Type.Number()),
   steps: Type.Optional(Type.Number()),
-  delayMs: Type.Optional(Type.Number({ description: "Milliseconds between characters in type_text fallback path." })),
+  delayMs: Type.Optional(Type.Number({ description: "Real character pacing for type_text_chars (default 3ms; 1–200ms). Prevents flooding keyboard-only app queues." })),
   text: Type.Optional(Type.String()),
   value: Type.Optional(Type.Any({ description: "Config value or set_value value." })),
-  key: Type.Optional(Type.String({ description: "Config key or key name for press_key, e.g. capture_mode, return, tab." })),
+  key: Type.Optional(Type.String({ description: "Config/press_key key; for type_text_chars, optional return/tab/escape commit delivered after text in the SAME ordered transaction." })),
   keys: Type.Optional(Type.Array(Type.String(), { description: "Hotkey array, e.g. ['cmd','c']." })),
   direction: Type.Optional(StringEnum(["up", "down", "left", "right"] as const)),
   amount: Type.Optional(Type.Number()),
@@ -384,83 +403,29 @@ async function runForcedKeystrokes(pi: ExtensionAPI, params: DriverInput, signal
   }
 
   const windows = await listDriverWindows(pi, false, signal, undefined, timeout);
-  const targetWindow = windows.find((window) => window.pid === pid && (params.windowId === undefined || window.window_id === params.windowId));
-  const appName = targetWindow?.app_name ?? "";
-  const windowTitle = targetWindow?.title ?? "";
-
-  onUpdate?.({ content: [{ type: "text", text: `Forcing ${text.length} character keystrokes to pid ${pid}${appName ? ` (${appName})` : ""}…` }] });
-  const script = `on run argv
-set targetPid to (item 1 of argv) as integer
-set payload to item 2 of argv
-set appName to item 3 of argv
-set targetTitle to item 4 of argv
-set priorPid to 0
-tell application "System Events"
-  try
-    set priorPid to unix id of first application process whose frontmost is true
-  end try
-end tell
-if appName is "Google Chrome" then
-  tell application "Google Chrome"
-    set foundWindow to false
-    repeat with w in windows
-      set windowName to ""
-      set activeTitle to ""
-      try
-        set windowName to given name of w as text
-      end try
-      try
-        set activeTitle to title of active tab of w as text
-      end try
-      if windowName is targetTitle or activeTitle is targetTitle then
-        set index of w to 1
-        set foundWindow to true
-        exit repeat
-      end if
-    end repeat
-    activate
-  end tell
-else
-  tell application "System Events"
-    set targetProcess to first application process whose unix id is targetPid
-    try
-      repeat with w in windows of targetProcess
-        if targetTitle is not "" and (name of w as text) contains targetTitle then
-          try
-            perform action "AXRaise" of w
-          end try
-          exit repeat
-        end if
-      end repeat
-    end try
-  end tell
-end if
-tell application "System Events"
-  set targetProcess to first application process whose unix id is targetPid
-  set frontmost of targetProcess to true
-end tell
-delay 0.1
-tell application "System Events" to keystroke payload
-delay 0.05
-tell application "System Events"
-  if priorPid is not 0 and priorPid is not targetPid then
-    try
-      set frontmost of first application process whose unix id is priorPid to true
-    end try
-  end if
-end tell
-end run`;
-  const result = await pi.exec("/usr/bin/osascript", ["-e", script, String(pid), text, appName, windowTitle], { signal, timeout });
-  const stderr = cleanCuaStderr(result.stderr?.trim() ?? "");
-  if (result.code !== 0) {
-    return { isError: true, content: [{ type: "text", text: stderr || result.stdout?.trim() || `Forced keystrokes failed with code ${result.code}.` }], details: { code: result.code, pid, characterCount: text.length, mode: "system-events-keystroke" } };
-  }
-  return { isError: false, content: [{ type: "text", text: `Typed ${text.length} character(s) as real keystrokes to pid ${pid}; restored prior app focus.` }], details: { code: result.code, pid, characterCount: text.length, mode: "system-events-keystroke" } };
+  const candidates = windows.filter(w => w.pid === pid && (params.windowId === undefined || w.window_id === params.windowId));
+  if (candidates.length !== 1 || !candidates[0].window_id) throw new Error("Real typing requires one exact window; provide windowId. No text dispatched.");
+  const target = candidates[0];
+  const state = await run(pi, CUA_DRIVER_BIN, driverToolArgs("get_window_state", { pid, window_id: target.window_id }, { compact: true } as DriverInput), signal, timeout, onUpdate);
+  if (state.isError) return state; // No text dispatched; never bypass observation failure.
+  const identifier = keyboardWindowIdentifier(String(parseJson(state.details?.stdout ?? "")?.tree_markdown ?? ""));
+  onUpdate?.({ content: [{ type: "text", text: `Ordered real typing to PID ${pid}…` }] });
+  return typeNativeCharacters(pi, {pid, windowId: target.window_id!, title: target.title ?? "", identifier},
+    text, {signal, timeoutMs: timeout, delayMs: params.delayMs, key: params.key});
 }
 
 function normalizeDriverParams(p: DriverInput): DriverInput {
   if (p.action === "get_window_state") return { ...p, action: "window_state" } as DriverInput;
   return p;
+}
+
+async function supplementDriverWindowResult(pi: ExtensionAPI, result: any, params: DriverInput, signal?: AbortSignal) {
+  if (result.isError) return result; // Never recover from MCP/permission errors by another transport.
+  const data = parseJson(result.details?.stdout ?? '');
+  if (!Array.isArray(data?.windows)) return result;
+  const windows = await supplementElevatedNativeWindows(pi, data.windows, params.pid, signal, new NativeDeadline(params.timeoutMs ?? CUA_TIMEOUT_MS));
+  const stdout = JSON.stringify({ ...data, windows });
+  return { ...result, content: [{type:'text',text:stdout}], details: {...result.details,stdout} };
 }
 
 function maybePostProcessDriverResult(result: Awaited<ReturnType<typeof run>>, params: DriverInput): Awaited<ReturnType<typeof run>> {
@@ -522,13 +487,16 @@ function maybePostProcessDriverResult(result: Awaited<ReturnType<typeof run>>, p
 
 export type { DriverInput };
 
-export default function (pi: ExtensionAPI) {
+export default function (hostPi: ExtensionAPI) {
+  const transport = createNativeMcpTransport(hostPi, CUA_DRIVER_BIN);
+  const pi = transport.api as ExtensionAPI;
   // Build the experimental semantic/background workflow inside the main Cua
   // extension without registering a second competing tool. This gives future
   // agents one vertically integrated `cua_driver` surface.
   let integratedWorkflowTool: any;
   nativeWorkflowExtension({
     exec: pi.exec.bind(pi),
+    cuaMcpReady: (pi as any).cuaMcpReady,
     registerTool(definition: any) {
       if (definition?.name === "cua_workflow_internal") integratedWorkflowTool = definition;
     },
@@ -537,6 +505,9 @@ export default function (pi: ExtensionAPI) {
   } as any);
   if (!integratedWorkflowTool) throw new Error("Cua integrated workflow failed to initialize.");
 
-  const driverTool = { name: "cua_driver", label: "Cua Driver", description: "Speed-first native macOS application control. Never use Cua for ordinary webpage DOM work; use web_cli first. For native apps, action=workflow batches a whole flow from one shared AX observation, refreshes only at real transitions or misses, and skips routine verification. Use workflow.action=parallel to execute independent windows concurrently in one call, or program for a complete JXA/AppleScript flow. Supports background targeting, cached windows, unlabeled role-only controls, and compact performance telemetry. Screenshot/zoom actions return actual images directly. Set screenshotAfter=true for a fresh target-window image after a workflow batch without an extra tool round trip.", promptSnippet: "Speed-first native Mac control: one-call batches, shared observations, concurrent independent windows, minimal verification.", promptGuidelines: ["Do not use cua_driver for routine Chrome webpage reading, navigation, links, buttons, forms, or DOM interaction. Use web_cli for Chrome DOM work and cua_driver workflow for native browser chrome or non-DOM native visuals.", "web_cli click/click-text and type already target DOM controls by selector/text without ad-hoc JavaScript. DOM clicks remain valid; use web_cli trusted-click/type for custom inputs or gesture gates. Preserve working web_cli and ALEKS paths.", "For native cua_driver workflow clicks, AX identifies controls; auto routes non-pressable controls to bounded AX-bounds mouse input. clickMode=mouse explicitly requests mouse input; clickMode=ax disables fallback. Use within ancestor context for duplicate controls such as Edit, Continue, Review, or Save; mutating ambiguous selectors fail closed. Ambiguous/missing bounds fail rather than guessing. Successful dispatch is not proof the UI changed; use verify or screenshotAfter when uncertain. Direct indexed clicks remain the driver AX API.", "cua_driver on-demand capture returns one fresh frame, not continuous sight. No recorder or polling starts by default. Temporary frames are discarded even without inline delivery; provide an explicit output path to keep a file. Images attached to chat still follow Pi session retention.", "Use cua_driver action=workflow as the primary native Mac control path. Prefer one complete program or the largest safe sequence rather than inspect/click/inspect loops.", "For background control while the user keeps working, pass workflow.app and optionally workflow.windowTitle; avoid relying on the frontmost window.", "Use workflow.action=sequence with observationPolicy=fast by default: it reuses one AX observation, refreshes on readiness waits or selector misses, and returns compact telemetry.", "Use workflow.action=parallel with tasks for two or more independent app/windows so target resolution and action batches run concurrently inside one tool call. Never put the same window in two parallel tasks.", "When a native flow can be expressed reliably as code, use workflow action=program with JavaScript or AppleScript so the entire operation runs in one osascript process; inspect once first only when selectors truly must be discovered.", "Do not make a separate verification call after a successful workflow. Add workflow.verify only for consequential endpoints, genuine ambiguity, or explicit user requests.", "Avoid fixed sleeps. Add a readiness wait only at a real UI transition such as opening a sheet; stable fields and controls should execute from the shared observation without reinspection.", "For cua_driver pixel clicks, use x/y exactly from the full window screenshot PNG. Coordinates are window-local image pixels: do not divide for Retina, convert to screen points, or add the window origin. Set fromZoom=true only for coordinates taken from a zoom image, and use debugImageOut when confidence is low.", "Use cua_driver action=type_text for fast normal AX insertion. If a surface such as DevTools rejects or silently ignores AX insertion, use type_text_chars to force real System Events keystrokes; it briefly fronts the target app and restores the prior app.", "When web_cli cannot see page-owned framework expandos or component state, Chrome DevTools is a legitimate browser-chrome fallback: open its Console with Cua, focus the prompt, then use type_text_chars for reliable real typing.", "After opening DevTools or switching a GPU-heavy native view, wait roughly 300–700ms before screenshot capture; if a capture is mostly black or stale, retry once after a short wait instead of reasoning from it.", "Use direct cua_driver actions for standalone screenshots, zoom, recording, cursor controls, and uncommon low-level operations. Use its page primitive only for non-Chrome native WebViews/debug targets or a confirmed web_cli failure—not as the normal Chrome path.", "For live Chrome pages, prefer web_cli or `web`; both default to the persistent Pi Automation window in the user's authenticated Chrome profile. Use `tab=active` only when explicitly requested. Sitegeist shares that same bot window and is only for canvas/SVG and difficult visual flows.", "For unlabeled native controls, use cua_driver workflow role plus occurrence. If a mouse fallback cannot uniquely resolve the bounds, request a fresh screenshot and use pixel_click; do not guess or force unsupported AXPress.", "Keep responseMode=compact for normal work. cua_driver screenshot and zoom return actual images directly; no follow-up read is needed. For visually dependent native tasks, use top-level screenshotAfter=true with a single-target workflow to inspect the outcome in the same call. Keep it off for routine AX/DOM work; this is on-demand capture, not continuous video recording."], parameters: driverSchema, async execute(_id, rawParams, signal, onUpdate, ctx) { try { const params0 = normalizeDriverParams(rawParams); if (params0.action === "workflow") { if (!params0.workflow) throw new Error("cua_driver action=workflow requires workflow parameters."); return await integratedWorkflowTool.execute(_id, params0.workflow, signal, onUpdate, ctx); } if (params0.action === "start") return await run(pi, "open", ["-n", "-g", "-a", "CuaDriver", "--args", "serve"], signal, params0.timeoutMs, onUpdate); if (!["status", "stop"].includes(params0.action) && params0.action !== "raw") await ensureCuaDriverDaemon(pi, signal); let params = params0; const pidMissing = params.pid === undefined || params.pid === null || params.pid === ""; if (pidMissing && PID_REQUIRED_ACTIONS.has(params.action) && !(params.action === "page" && params.pageAction === "enable_javascript_apple_events")) { params = await resolveDriverTarget(pi, params, signal, onUpdate); } if (params.action === "type_text_chars") return await runForcedKeystrokes(pi, params, signal, onUpdate); const elementWindowActions = ["click", "double_click", "right_click", "type_text", "set_value", "press_key", "scroll"]; const canResolveWindow = params.pid !== undefined && (["window_state", "page", "screenshot"].includes(params.action) || (elementWindowActions.includes(params.action) && (params.elementIndex !== undefined || params.action === "set_value"))) && !(params.action === "page" && params.pageAction === "enable_javascript_apple_events"); if (canResolveWindow && params.windowId === undefined) return maybePostProcessDriverResult(await runDriverWithResolvedWindow(pi, params, signal, onUpdate), params); if (params.action === "screenshot" && params.windowId === undefined) return await runFullScreenScreenshot(pi, params, signal, onUpdate); const args = buildDriverArgs(params); const result = await run(pi, CUA_DRIVER_BIN, args, signal, params.timeoutMs, onUpdate); const stale = result.isError && /No window with window_id|window_id .*does not exist|must belong to pid/i.test(`${result.details?.stdout}\n${result.details?.stderr}`); if (stale && canResolveWindow) return maybePostProcessDriverResult(await runDriverWithResolvedWindow(pi, { ...params, windowId: undefined }, signal, onUpdate), params); return maybePostProcessDriverResult(result, params); } catch (e) { return { isError: true, content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }], details: { params: rawParams, nativeFailure: e && typeof e === "object" && "failure" in e ? (e as any).failure : undefined } }; } } };
-  pi.registerTool(withVisualResults(driverTool, pi, CUA_DRIVER_BIN));
+  const driverTool = { name: "cua_driver", label: "Cua Driver", description: "REPAIR-FIRST CONTRACT: If a native interaction fails, is unreliable, or requires repeated unproductive calls, stop unchanged retries immediately. Inspect the actual target/outcome; repair the reusable Cua implementation, add a regression for that exact failure, consolidate/refactor shared paths instead of accumulating one-off patches, validate, reload, and retest through cua_driver. Never replay a possibly committed mutation; permissions/authentication/user cancellation are blockers, not bypass targets. Report dispatch separately from verified success. Preserve real native clicks, cursor movement and focus takeover; no decorative pointer animation. Minimum-call native macOS application control through persistent Pi-native MCP, preserving the custom workflow layer. Never use Cua for ordinary webpage DOM work; use web_cli first. For native apps, prefer one action=workflow call containing the complete safe flow: sequence for one window, parallel for independent windows, or program for a complete JXA/AppleScript operation. Workflows reuse one AX observation, refresh only at real transitions or misses, and skip routine verification. Supports background targeting, cached windows, unlabeled role-only controls, and compact performance telemetry. Set screenshotAfter=true to return a fresh final image in the same workflow call.", promptSnippet: "Native Mac control with mandatory diagnose → reusable repair/refactor → regression test → reload → verified retry; never loop unchanged failed actions.", promptGuidelines: ["Real native clicks, actual cursor movement, and focus takeover are important and must remain available for apps that require them. The user's preference is no decorative animated agent cursor: remove the visual glide/dwell, not native input capability. Cua uses Pi's persistent native MCP server cua_native by default while preserving this wrapper's batching, targeting, deadlines, screenshots, and no-replay safeguards. Continue using cua_driver workflows, not raw MCP tools for routine automation. Never fall back to CLI after a native MCP error or permission denial. Use /mcp to diagnose connection state; /cua-transport cli is an explicit whole-session rollback. AX indices, zoom state, and recording belong to this MCP connection and must not be mixed with the legacy CLI daemon or another session. Tool results report details.transport; metadata discovery and native scripts may still use their established subprocesses.", "Do not use cua_driver for routine Chrome webpage reading, navigation, links, buttons, forms, or DOM interaction. Use web_cli for Chrome DOM work and cua_driver workflow for native browser chrome or non-DOM native visuals.", "web_cli click/click-text and type already target DOM controls by selector/text without ad-hoc JavaScript. DOM clicks remain valid; use web_cli trusted-click/type for custom inputs or gesture gates. Preserve working web_cli and ALEKS paths.", "For native cua_driver workflow clicks, AX identifies controls; auto routes non-pressable controls to bounded AX-bounds mouse input. clickMode=mouse explicitly requests mouse input; clickMode=ax disables fallback. Use within ancestor context for duplicate controls such as Edit, Continue, Review, or Save; mutating ambiguous selectors fail closed. Ambiguous/missing bounds fail rather than guessing. Successful dispatch is not proof the UI changed; use verify or screenshotAfter when uncertain. Direct indexed clicks remain the driver AX API.", "cua_driver on-demand capture returns one fresh frame, not continuous sight. No recorder or polling starts by default. Temporary frames are discarded even without inline delivery; provide an explicit output path to keep a file. Images attached to chat still follow Pi session retention.", "For simple foregrounding use workflow.action=activate with the exact PID/windowId. For Chrome use web_cli action=focus or foreground=true; its Cua helper uses text-safe Chrome IDs and guards the exact tab before native focus. Avoid hand-written numeric AppleScript comparisons for Chrome IDs.", "MINIMUM-CALL WORKFLOW: use cua_driver action=workflow as the primary native path. Use workflow.sequence for the largest safe complete flow in one window, workflow.parallel for two or more independent windows, or workflow.program when one JXA/AppleScript process can perform the entire operation. Do not fragment a known workflow into inspect/click/inspect loops.", "For background control while the user keeps working, pass workflow.app and optionally workflow.windowTitle; avoid relying on the frontmost window.", "Use workflow.action=sequence with observationPolicy=fast by default: it reuses one AX observation, refreshes on readiness waits or selector misses, and returns compact telemetry.", "Use workflow.action=parallel with tasks for two or more independent app/windows so target resolution and action batches run concurrently inside one tool call. Never put the same window in two parallel tasks.", "When a native flow can be expressed reliably as code, use workflow action=program with JavaScript or AppleScript so the entire operation runs in one osascript process; inspect once first only when selectors truly must be discovered.", "Do not make a separate verification call after a successful workflow. Put workflow.verify on the same call only for consequential endpoints or genuine ambiguity, and use top-level screenshotAfter=true when the final visual itself is the needed result.", "If selectors must first be discovered, inspect once, then issue the whole mutation flow in one sequence/program call. Do not repeatedly rediscover stable controls between steps.", "Avoid fixed sleeps. Add a readiness wait only at a real UI transition such as opening a sheet; stable fields and controls should execute from the shared observation without reinspection.", "For cua_driver pixel clicks, use x/y exactly from the full window screenshot PNG. Coordinates are window-local image pixels: do not divide for Retina, convert to screen points, or add the window origin. Set fromZoom=true only for coordinates taken from a zoom image, and use debugImageOut when confidence is low.", "Use type_text for normal AX insertion. For keyboard-only consoles use type_text_chars with exact pid/windowId and optional key=return/tab/escape: paced text and commit are one ordered System Events transaction. Never send a separate Return that can overtake queued text. Its success is dispatch-only; verify the app outcome. Real typing briefly fronts the exact target and restores prior focus.", "When web_cli cannot see page-owned framework expandos or component state, Chrome DevTools is a legitimate browser-chrome fallback: open its Console with Cua, focus the prompt, then use type_text_chars for reliable real typing.", "After opening DevTools or switching a GPU-heavy native view, wait roughly 300–700ms before screenshot capture; if a capture is mostly black or stale, retry once after a short wait instead of reasoning from it.", "Use direct cua_driver actions for standalone screenshots, zoom, recording, cursor controls, and uncommon low-level operations. Use its page primitive only for non-Chrome native WebViews/debug targets or a confirmed web_cli failure—not as the normal Chrome path.", "For live Chrome pages, prefer web_cli or `web`; both default to the persistent Pi Automation window in the user's authenticated Chrome profile. Use `tab=active` only when explicitly requested. Sitegeist shares that same bot window and is only for canvas/SVG and difficult visual flows.", "For unlabeled native controls, use cua_driver workflow role plus occurrence. If a mouse fallback cannot uniquely resolve bounds, request a fresh screenshot and use pixel_click; do not guess or force unsupported AXPress. For an AX-invisible owner-drawn NATIVE dialog button with visible text, use an explicit one-call vision_click step with exact query plus visible within context, and expectWindowClosed for a quit; it captures local OCR, clicks once, and verifies the window without another model round trip. Never use it for webpage DOM or without permission to discard unsaved data.", "Keep responseMode=compact for normal work. cua_driver screenshot and zoom return actual images directly; no follow-up read is needed. For visually dependent native tasks, use top-level screenshotAfter=true with a single-target workflow to inspect the outcome in the same call. Keep it off for routine AX/DOM work; this is on-demand capture, not continuous video recording.", "Choose the narrowest proven native strategy: semantic AX targeting first; role+occurrence for unlabeled controls; background window targeting when possible; one batched workflow/program for deterministic flows; a fresh screenshot/zoom and pixel_click only when AX genuinely cannot expose the visual target.", "If cua_driver cannot fully observe, target, mutate, type, verify, or continue a native flow as expected, treat that as a reusable tool bottleneck. Inspect the exact AX/native-app pattern and failure telemetry, improve ~/.pi/agent/extensions/cua-tool/index.ts or its integrated workflow/native driver layer as appropriate, preserve proven behavior, validate, reload Pi with mode='continue', and retry the original cua_driver operation from the same state. Do not silently abandon the task or substitute unexplained brittle clicks."], parameters: driverSchema, async execute(_id, rawParams, signal, onUpdate, ctx) { try { const params0 = normalizeDriverParams(rawParams); if (params0.action === "workflow") { if (!params0.workflow) throw new Error("cua_driver action=workflow requires workflow parameters."); return await integratedWorkflowTool.execute(_id, params0.workflow, signal, onUpdate, ctx); } if (params0.action === "start") return await run(pi, "open", ["-n", "-g", "-a", "CuaDriver", "--args", "serve"], signal, params0.timeoutMs, onUpdate); if (!["status", "stop"].includes(params0.action) && params0.action !== "raw") await ensureCuaDriverDaemon(pi, signal); let params = params0; const pidMissing = params.pid === undefined || params.pid === null || params.pid === ""; if (pidMissing && PID_REQUIRED_ACTIONS.has(params.action) && !(params.action === "page" && params.pageAction === "enable_javascript_apple_events")) { params = await resolveDriverTarget(pi, params, signal, onUpdate); } if (params.action === "hotkey" && /^f(?:[1-9]|1[0-2])$/i.test(params.keys?.at(-1) ?? "")) { const windowId = params.windowId ?? await resolveDriverWindowId(pi, params, signal, onUpdate); return await integratedWorkflowTool.execute(_id, { action: "act", stepAction: "hotkey", pid: params.pid, windowId, app: params.appName, keys: params.keys, timeoutMs: params.timeoutMs }, signal, onUpdate, ctx); } if (params.action === "type_text_chars") return await runForcedKeystrokes(pi, params, signal, onUpdate); const elementWindowActions = ["click", "double_click", "right_click", "type_text", "set_value", "press_key", "scroll"]; const canResolveWindow = params.pid !== undefined && (["window_state", "page", "screenshot"].includes(params.action) || (elementWindowActions.includes(params.action) && (params.elementIndex !== undefined || params.action === "set_value"))) && !(params.action === "page" && params.pageAction === "enable_javascript_apple_events"); if (canResolveWindow && params.windowId === undefined) return maybePostProcessDriverResult(await runDriverWithResolvedWindow(pi, params, signal, onUpdate), params); if (params.action === "screenshot" && params.windowId === undefined) return await runFullScreenScreenshot(pi, params, signal, onUpdate); const args = buildDriverArgs(params); let result = await run(pi, CUA_DRIVER_BIN, args, signal, params.timeoutMs, onUpdate); if (params.action === 'list_windows') result = await supplementDriverWindowResult(pi, result, params, signal); const stale = result.isError && /No window with window_id|window_id .*does not exist|must belong to pid/i.test(`${result.details?.stdout}\n${result.details?.stderr}`); if (stale && canResolveWindow && ["window_state", "screenshot"].includes(params.action)) return maybePostProcessDriverResult(await runDriverWithResolvedWindow(pi, { ...params, windowId: undefined }, signal, onUpdate), params); return addCuaRecovery(maybePostProcessDriverResult(result, params)); } catch (e) { return addCuaRecovery({ isError: true, content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }], details: { params: rawParams, nativeFailure: e && typeof e === "object" && "failure" in e ? (e as any).failure : undefined } }); } } };
+  const registeredTool = transport.wrap(withAutomationRepair(withVisualResults(driverTool, pi, CUA_DRIVER_BIN), `${fileURLToPath(import.meta.url)} and its integrated native workflow/driver layer`));
+  // Package installs may live in a git checkout, not ~/.pi/agent/extensions.
+  registeredTool.promptGuidelines = registeredTool.promptGuidelines.map((text: string) => text.replaceAll("~/.pi/agent/extensions/cua-tool/index.ts", fileURLToPath(import.meta.url)));
+  pi.registerTool(registeredTool);
 }

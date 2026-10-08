@@ -1,15 +1,21 @@
 {
   "name": "littlecua",
-  "version": "1.2.0",
-  "description": "LittleCua — Pi extensions that add native macOS automation (cua_driver) and live Chrome control (web_cli) to the Pi coding agent.",
+  "version": "1.3.0",
+  "description": "LittleCua — MCP-native macOS and authenticated Chrome automation for Pi, with batched workflows and a repair-first/no-replay contract.",
   "keywords": ["pi-package"],
   "scripts": {
-    "test": "node extensions/cua-tool/tests/native-operation-coordinator.test.mjs && node extensions/cua-tool/tests/native-pointer.test.mjs && node extensions/cua-tool/tests/native-workflow-speed.test.mjs && node extensions/cua-tool/tests/visual-results.test.mjs",
+    "test": "node scripts/test.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "generate:dom": "node extensions/web-cli/generate-dom-templates.mjs",
+    "test:mcp-live": "node extensions/cua-tool/tests/native-mcp-live.mjs",
+    "test:web-live": "node extensions/web-cli/tests/native-web-live.mjs",
+    "test:readiness-live": "node extensions/web-cli/tests/readiness-focus-live.mjs",
     "test:live": "node extensions/cua-tool/tests/visual-live.mjs",
     "test:fixture": "node extensions/cua-tool/tests/native-fixture.e2e.mjs",
     "test:business": "node extensions/cua-tool/tests/business-fixture.e2e.mjs",
     "test:business-inform": "node extensions/cua-tool/tests/business-workflow-informed.mjs"
   },
+  "engines": { "node": ">=22.19.0" },
   "license": "MIT",
   "author": "MaxAutomize",
   "repository": {

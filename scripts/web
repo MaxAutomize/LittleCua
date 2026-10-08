@@ -15,7 +15,20 @@
 
 set -euo pipefail
 
-WEB_CACHE="/tmp/web-chrome-target"
+# Share the extension's runtime resolution; no PATH symlink is required.
+# An explicit override never silently falls back to another installed binary.
+cua-driver() {
+    local driver="${CUA_DRIVER_BIN:-/Applications/CuaDriver.app/Contents/MacOS/cua-driver}"
+    if [[ -x "$driver" ]]; then
+        "$driver" "$@"
+    elif [[ -n "${CUA_DRIVER_BIN:-}" ]]; then
+        command "$CUA_DRIVER_BIN" "$@"
+    else
+        command cua-driver "$@"
+    fi
+}
+
+WEB_CACHE="${WEB_CACHE:-/tmp/web-chrome-target}"
 WEB_SESSION_FILE="${WEB_SESSION_FILE:-$HOME/.pi/agent/state/chrome-session.env}"
 WEB_SESSION_NAME="${WEB_SESSION_NAME:-Pi Automation}"
 PID="${WEB_PID:-}"
@@ -42,6 +55,16 @@ release_session_lock() {
 acquire_session_lock() {
     local deadline=$((SECONDS + ${WEB_LOCK_TIMEOUT_SECONDS:-20})) owner=""
     mkdir -p "$(dirname "$WEB_SESSION_FILE")"
+    # A Pi-native MCP workflow can hold this SAME lock across a complete sequence.
+    # Only its child with the matching private lease may reuse it; the child must
+    # never remove its parent's lease. Standalone CLI callers are unchanged.
+    if [[ -n "${WEB_PARENT_LOCK_PID:-}" && -n "${WEB_PARENT_LOCK_TOKEN:-}" &&
+          -f "$SESSION_LOCK_DIR/pid" && -f "$SESSION_LOCK_DIR/token" &&
+          "$(<"$SESSION_LOCK_DIR/pid")" == "$WEB_PARENT_LOCK_PID" &&
+          "$(<"$SESSION_LOCK_DIR/token")" == "$WEB_PARENT_LOCK_TOKEN" ]] &&
+          kill -0 "$WEB_PARENT_LOCK_PID" 2>/dev/null; then
+        return 0
+    fi
     while ! mkdir "$SESSION_LOCK_DIR" 2>/dev/null; do
         if [[ -f "$SESSION_LOCK_DIR/pid" ]]; then owner=$(<"$SESSION_LOCK_DIR/pid"); else owner=""; fi
         if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
@@ -312,12 +335,12 @@ cache_native_session_target() {
     }
     printf '%s' "$result" | python3 -c '
 import json, sys
-cache, bounds, chrome_window_id, chrome_tab_id = sys.argv[1:5]
+cache, bounds, chrome_window_id, chrome_tab_id, session_name = sys.argv[1:6]
 x, y, width, height = map(int, bounds.split(","))
 try:
     data = json.load(sys.stdin)
     wins = [w for w in data.get("windows", []) if w.get("app_name") == "Google Chrome"]
-    named = [w for w in wins if w.get("title") == "Pi Automation"]
+    named = [w for w in wins if w.get("title") == session_name]
     bounded = [w for w in wins if all(abs(int((w.get("bounds") or {}).get(k, -99999)) - v) <= 3 for k, v in (("x",x),("y",y),("width",width),("height",height)))]
     matched = named or bounded
     if not matched:
@@ -330,7 +353,7 @@ try:
         f.write(line + "\n")
 except Exception:
     raise SystemExit(1)
-' "$WEB_CACHE" "$SESSION_BOUNDS" "$SESSION_WINDOW_ID" "$SESSION_TAB_ID"
+' "$WEB_CACHE" "$SESSION_BOUNDS" "$SESSION_WINDOW_ID" "$SESSION_TAB_ID" "$WEB_SESSION_NAME"
 }
 
 try_cached_session_target() {
@@ -603,17 +626,37 @@ cmd_find_inputs() {
     run_js "(()=>{const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);return JSON.stringify(Array.from(document.querySelectorAll('input,textarea,select')).filter(e=>visible(e)&&e.type!=='hidden').map((e,i)=>({i,tag:e.tagName,type:e.type||'',name:e.name||'',id:e.id||'',value:(e.value||'').slice(0,80),placeholder:e.placeholder||'',label:(e.labels&&e.labels[0]?e.labels[0].innerText.trim().slice(0,80):''),required:!!e.required})).slice(0,100))})()"
 }
 
+# FullCalendar time slots require native pointer-down/up, not HTMLElement.click().
+# Shared preflight runs BEFORE any mutation; normal buttons retain fast DOM clicks.
+click_pointer_preflight_js() {
+    printf '%s' "const pointerTarget=$1;if(pointerTarget.closest('.fc-slats tr[data-time],.fc-timegrid-slots tr[data-time]')&&pointerTarget.closest('.fc-time-grid,.fc-timegrid')&&!pointerTarget.closest('a,button,input,select,textarea,[role=button]'))return JSON.stringify({requiresTrustedClick:true,dispatched:false,reason:'fullcalendar-slot-pointer'});"
+}
+
+run_click_js() {
+    local source="$1" route="$2" target="$3" tags="${4:-}" output
+    output=$(run_action_js "$source") || return $?
+    # This explicit pre-dispatch routing result is NOT a mutation/error retry.
+    if [[ "$output" == '{"requiresTrustedClick":true,"dispatched":false,'* ]]; then
+        if [[ "$route" == "text" ]]; then cmd_trusted_click_text "$target" "$tags"
+        else cmd_trusted_click "$target"; fi
+    else
+        printf '%s\n' "$output"
+    fi
+}
+
 cmd_click() {
-    local selector_q
+    local selector_q pointer_preflight
     selector_q=$(json_quote "${1:?Usage: web click <selector>}")
-    run_action_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});if(e.disabled||e.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',selector});e.scrollIntoView({block:'center',inline:'center'});e.focus({preventScroll:true});e.click();return JSON.stringify({clicked:true,synthetic:true,tag:e.tagName,text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim().slice(0,80)})})()"
+    pointer_preflight=$(click_pointer_preflight_js e)
+    run_click_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});if(e.disabled||e.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',selector});e.scrollIntoView({block:'center',inline:'center'});$pointer_preflight e.focus({preventScroll:true});e.click();return JSON.stringify({clicked:true,synthetic:true,tag:e.tagName,text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim().slice(0,80)})})()" selector "$1"
 }
 
 cmd_click_text() {
-    local text_q selector_q
+    local text_q selector_q pointer_preflight
     text_q=$(json_quote "${1:?Usage: web click-text <text>}")
     selector_q=$(json_quote "${2:-a,button,input,select,textarea,[role],label,[onclick]}")
-    run_action_js "(()=>{const needle=$text_q;const selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||'');const norm=s=>String(s||'').replace(/\\s+/g,' ').trim().toLowerCase();const q=norm(needle);const interactive=e=>/^(A|BUTTON|INPUT|SELECT|TEXTAREA|MAT-OPTION)$/.test(e.tagName)||['button','option','menuitem','radio','checkbox','link','tab'].includes(e.getAttribute('role'));const depth=e=>{let d=0;for(let n=e;n;n=n.parentElement)d++;return d};const candidates=Array.from(document.querySelectorAll(selector)).filter(e=>visible(e)&&norm(txt(e)).includes(q)).map((e,order)=>{const n=norm(txt(e));return{e,order,score:(n===q?100000:n.startsWith(q)?50000:10000)+(interactive(e)?2000:0)+depth(e)*5-Math.min(n.length,1000)}}).sort((a,b)=>b.score-a.score||a.order-b.order);const found=candidates[0]?.e;if(!found)return JSON.stringify({error:'No element found with text',text:needle});if(found.disabled||found.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',text:needle,tag:found.tagName});found.scrollIntoView({block:'center',inline:'center'});found.focus({preventScroll:true});found.click();return JSON.stringify({clicked:true,synthetic:true,tag:found.tagName,text:txt(found).trim().slice(0,80),href:found.href||'',exact:Math.abs((candidates[0]?.score||0))>=100000})})()"
+    pointer_preflight=$(click_pointer_preflight_js found)
+    run_click_js "(()=>{const needle=$text_q;const selector=$selector_q;const visible=e=>!!(e.offsetWidth||e.offsetHeight||e.getClientRects().length);const txt=e=>(e.innerText||e.value||e.getAttribute('aria-label')||e.title||e.placeholder||'');const norm=s=>String(s||'').replace(/\\s+/g,' ').trim().toLowerCase();const q=norm(needle);const interactive=e=>/^(A|BUTTON|INPUT|SELECT|TEXTAREA|MAT-OPTION)$/.test(e.tagName)||['button','option','menuitem','radio','checkbox','link','tab'].includes(e.getAttribute('role'));const depth=e=>{let d=0;for(let n=e;n;n=n.parentElement)d++;return d};const candidates=Array.from(document.querySelectorAll(selector)).filter(e=>visible(e)&&norm(txt(e)).includes(q)).map((e,order)=>{const n=norm(txt(e));return{e,order,score:(n===q?100000:n.startsWith(q)?50000:10000)+(interactive(e)?2000:0)+depth(e)*5-Math.min(n.length,1000)}}).sort((a,b)=>b.score-a.score||a.order-b.order);const found=candidates[0]?.e;if(!found)return JSON.stringify({error:'No element found with text',text:needle});if(found.disabled||found.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',text:needle,tag:found.tagName});found.scrollIntoView({block:'center',inline:'center'});$pointer_preflight found.focus({preventScroll:true});found.click();return JSON.stringify({clicked:true,synthetic:true,tag:found.tagName,text:txt(found).trim().slice(0,80),href:found.href||'',exact:Math.abs((candidates[0]?.score||0))>=100000})})()" text "$1" "${2:-a,button,input,select,textarea,[role],label,[onclick]}"
 }
 
 run_main_js() {
@@ -715,8 +758,15 @@ cmd_value() {
 NATIVE_PID=""
 NATIVE_WID=""
 prepare_exact_chrome_target() {
-    local record
-    record=$(resolve_target_record "$TAB_TARGET") || return 1
+    local record target="$TAB_TARGET"
+    # In fast session mode the empty tab target means the cached Pi Automation
+    # tab. Native trusted actions still need its explicit Chrome tab ID.
+    if [[ -z "$target" ]]; then
+        load_session
+        [[ "$SESSION_TAB_ID" =~ ^[0-9]+$ ]] || { echo "Error: Pi Automation tab is unavailable." >&2; return 1; }
+        target="tab:$SESSION_TAB_ID"
+    fi
+    record=$(resolve_target_record "$target") || return 1
     parse_session_record "$record"
 }
 
@@ -777,8 +827,37 @@ end run
 APPLESCRIPT
 }
 
+ensure_instant_native_pointer() {
+    # The visual overlay is process-local and may reset when a daemon starts.
+    # Disable it before a real pointer event, not merely in the saved config.
+    # No effect on actual OS clicks; removes the default 750ms glide/400ms dwell.
+    [[ "${WEB_SHOW_AGENT_CURSOR:-0}" == "1" ]] && return 0
+    # A one-shot `call` has fresh defaults every time: disabling one invocation
+    # does not disable the next click. Require the persistent daemon first.
+    if ! cua-driver status >/dev/null 2>&1; then
+        open -n -g -a CuaDriver --args serve
+        local attempt=0
+        until cua-driver status >/dev/null 2>&1; do
+            (( attempt += 1 )) || true
+            if (( attempt >= 30 )); then
+                echo 'Error: persistent Cua click service did not start; refusing an animated one-shot fallback.' >&2
+                return 1
+            fi
+            sleep 0.05
+        done
+    fi
+    cua-driver call set_agent_cursor_enabled '{"enabled":false}' --compact >/dev/null || return 1
+    local state
+    state=$(cua-driver call get_agent_cursor_state '{}' --compact) || return 1
+    [[ "$state" == *"enabled=false"* ]] || {
+        echo 'Error: native cursor overlay did not disable; click not dispatched.' >&2
+        return 1
+    }
+}
+
 trusted_click_from_js() {
     local geometry_js="$1" geometry parsed x y label payload result rc=0
+    ensure_instant_native_pointer || return 1
     geometry=$(run_js "$geometry_js") || return 1
     if ! parsed=$(printf '%s' "$geometry" | python3 -c '
 import json, sys
@@ -809,7 +888,7 @@ print("{}\t{}\t{}".format(round(float(j["x"])), round(float(j["y"])), str(j.get(
 cmd_trusted_click() {
     local selector_q
     selector_q=$(json_quote "${1:?Usage: web trusted-click <selector>}")
-    trusted_click_from_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});if(e.disabled||e.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',selector});e.scrollIntoView({block:'center',inline:'center'});const r=e.getBoundingClientRect(),d=devicePixelRatio||1,ox=Math.max(0,(outerWidth-innerWidth)/2),oy=Math.max(0,outerHeight-innerHeight);return JSON.stringify({x:(ox+r.left+r.width/2)*d,y:(oy+r.top+r.height/2)*d,text:(e.innerText||e.value||e.getAttribute('aria-label')||'').trim()})})()"
+    trusted_click_from_js "(()=>{const selector=$selector_q;const e=document.querySelector(selector);if(!e)return JSON.stringify({error:'Element not found',selector});if(e.disabled||e.getAttribute('aria-disabled')==='true')return JSON.stringify({error:'Element is disabled',selector});let target=e;if(e.type==='file'&&!e.getBoundingClientRect().width){target=(e.id&&[...document.querySelectorAll('label')].find(l=>l.htmlFor===e.id))||e.closest('label')||e}target.scrollIntoView({block:'center',inline:'center'});const r=target.getBoundingClientRect();if(!r.width||!r.height)return JSON.stringify({error:'Element has no clickable bounds',selector});const d=devicePixelRatio||1,ox=Math.max(0,(outerWidth-innerWidth)/2),oy=Math.max(0,outerHeight-innerHeight);return JSON.stringify({x:(ox+r.left+r.width/2)*d,y:(oy+r.top+r.height/2)*d,text:(target.innerText||target.value||target.getAttribute('aria-label')||'').trim()})})()"
 }
 
 cmd_trusted_click_text() {
@@ -838,6 +917,7 @@ cmd_type() {
     local selector="${1:?Usage: web type <selector> <value> [return|tab|escape]}"
     local value="${2:?Usage: web type <selector> <value> [return|tab|escape]}"
     local commit_key="${3:-}" selector_q geometry parsed x y label payload result rc=0
+    ensure_instant_native_pointer || return 1
     commit_key=$(printf '%s' "$commit_key" | tr '[:upper:]' '[:lower:]')
     case "$commit_key" in
         ""|none|return|enter|tab|escape|esc) ;;
@@ -876,7 +956,15 @@ on run argv
   tell application "System Events"
     keystroke "a" using command down
     delay 0.03
-    keystroke payload
+    set previousDelimiters to text item delimiters of AppleScript
+    set text item delimiters of AppleScript to "[[RIGHT]]"
+    set textChunks to every text item of payload
+    set text item delimiters of AppleScript to previousDelimiters
+    repeat with chunkIndex from 1 to count of textChunks
+      set chunk to item chunkIndex of textChunks
+      if chunk is not "" then keystroke chunk
+      if chunkIndex < count of textChunks then key code 124
+    end repeat
     delay 0.03
     if commitKey is "return" or commitKey is "enter" then
       key code 36

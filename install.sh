@@ -1,72 +1,33 @@
 #!/usr/bin/env bash
-# One-command installer for LittleCua.
-# Checks/installs Node, Pi, the native runtimes (CuaDriver + the web Chrome shim),
-# then registers this package with Pi. Safe to re-run.
-#
-# macOS only — both tools drive macOS-native runtimes (CuaDriver.app + AppleScript).
+# Explicit setup for the local checkout; never upgrades the driver or grants TCC.
 set -euo pipefail
-
-BOLD="\033[1m"; GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; RESET="\033[0m"
-say() { printf "${BOLD}${GREEN}==>${RESET} %s\n" "$1"; }
-warn() { printf "${BOLD}${YELLOW}!! ${RESET} %s\n" "$1"; }
-err() { printf "${BOLD}${RED}XX ${RESET} %s\n" "$1" >&2; }
-
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-# --- OS guard ---------------------------------------------------------------
-if [ "$(uname -s)" != "Darwin" ]; then
-  err "This package is macOS-only (CuaDriver.app + AppleScript). Found $(uname -s)."
-  exit 1
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo 'LittleCua requires macOS.' >&2; exit 1
 fi
-
-# --- Node ------------------------------------------------------------------
-if ! command -v node >/dev/null 2>&1; then
-  warn "Node not found. Install Node 18+ first: https://nodejs.org/  (or: brew install node)"
-  exit 1
+if ! command -v node >/dev/null || ! command -v npm >/dev/null; then
+    echo 'Install Node >=22.19.0 and npm first (brew install node).' >&2; exit 1
 fi
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-if [ "$NODE_MAJOR" -lt 18 ]; then
-  err "Node 18+ required (found $(node -v))."
-  exit 1
+node -e 'const [a,b]=process.versions.node.split(".").map(Number); if(a<22||(a===22&&b<19)) { console.error("Node >=22.19.0 required"); process.exit(1); }'
+if ! command -v pi >/dev/null; then
+    echo 'Installing Pi…'
+    npm install -g @earendil-works/pi-coding-agent
 fi
-say "Node OK ($(node -v))"
-
-# --- Pi --------------------------------------------------------------------
-if ! command -v pi >/dev/null 2>&1; then
-  say "Installing Pi (global npm)…"
-  npm install -g @earendil-works/pi-coding-agent
-fi
-say "Pi OK ($(pi --version))"
-
-# --- CuaDriver (native runtime for cua_driver) -----------------------------
-CUA_BIN="${CUA_DRIVER_BIN:-/Applications/CuaDriver.app/Contents/MacOS/cua-driver}"
-if [ ! -x "$CUA_BIN" ] && ! command -v cua-driver >/dev/null 2>&1; then
-  warn "CuaDriver.app not found at $CUA_BIN."
-  warn "  Download from https://github.com/cua-framework/cua/releases and drag CuaDriver.app into /Applications."
-  warn "  On first run, grant Accessibility + Screen Recording permissions."
-else
-  say "CuaDriver OK ($CUA_BIN)"
-fi
-
-# --- web CLI shim (native runtime for web_cli, bundled here) ---------------
+# Fail before changing the browser shim if any prerequisite is missing.
+node "$REPO_DIR/scripts/doctor.mjs"
 WEB_BIN="${WEB_CLI_PATH:-$HOME/.local/bin/web}"
-mkdir -p "$HOME/.local/bin"
-if [ -f "$REPO_DIR/scripts/web" ]; then
-  cp "$REPO_DIR/scripts/web" "$WEB_BIN"
-  chmod +x "$WEB_BIN"
-  say "web shim installed → $WEB_BIN"
-else
-  warn "scripts/web not found in repo; web_cli will need WEB_CLI_PATH set or a 'web' binary on PATH."
+mkdir -p "$(dirname "$WEB_BIN")"
+if [[ "$WEB_BIN" != "$REPO_DIR/scripts/web" ]]; then
+    if [[ -e "$WEB_BIN" ]]; then
+        BACKUP="$(mktemp "${WEB_BIN}.littlecua-backup.XXXXXX")"
+        cp -p "$WEB_BIN" "$BACKUP"
+        echo "Previous web shim saved: $BACKUP"
+    fi
+    cp "$REPO_DIR/scripts/web" "$WEB_BIN"
+    chmod +x "$WEB_BIN"
 fi
-
-# --- Chrome ----------------------------------------------------------------
-if [ ! -d "/Applications/Google Chrome.app" ]; then
-  warn "Google Chrome not found in /Applications. web_cli needs Chrome + its AppleScript dictionary."
-fi
-
-# --- Register this package with Pi ----------------------------------------
-say "Registering LittleCua with Pi (local checkout)…"
 pi install "$REPO_DIR"
-
-say "Done. Start/reload Pi and ask the agent to use cua_driver or web_cli."
-warn "If Pi was already running, run /reload inside it to load the new tools."
+printf 'LittleCua registered; web shim: %s\n' "$WEB_BIN"
+echo 'Reload Pi with /reload. /mcp should show cua_native and web_native.'
+echo 'Grant macOS permissions manually, and enable Chrome Allow JavaScript from Apple Events.'
+echo 'Do not load another copy of cua_driver/web_cli alongside this package.'

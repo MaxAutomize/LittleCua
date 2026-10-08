@@ -1,8 +1,11 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
-const BIN = "cua-driver";
-const WEB_BIN = "/Users/maxrippley/.local/bin/web";
+const BIN = process.env.CUA_DRIVER_BIN ?? (existsSync("/Applications/CuaDriver.app/Contents/MacOS/cua-driver") ? "/Applications/CuaDriver.app/Contents/MacOS/cua-driver" : "cua-driver");
+const WEB_BIN = process.env.WEB_CLI_PATH ?? join(homedir(), ".local/bin/web");
 const execFileAsync = promisify(execFile);
 const TARGET_TTL_MS = 60_000;
 

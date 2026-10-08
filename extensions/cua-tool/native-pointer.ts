@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NativeDeadline, nativeOperationCoordinator, targetOperationKeys } from "./native-operation-coordinator.ts";
+import { supplementElevatedNativeWindows } from "./native-window-catalog.ts";
 
 /** Driver 0.1.4 has no bounds-query or force-mouse-by-index API. Read AX geometry
  * through System Events, then use only the driver's documented pixel click.
@@ -53,13 +54,17 @@ export function pointerIdentity(element: { role: string; line: string; label: st
   return { role: element.role, identifier, label: quoted?.[1] ?? described?.[1] ?? element.label };
 }
 
-export function pixelCenter(rect: any, window: any, image: { width: number; height: number }) {
+export function pixelCenter(rect: any, window: any, image: { width: number; height: number }, anchor: 'center' | 'trailing' = 'center') {
   for (const n of [rect.x, rect.y, rect.width, rect.height, window.x, window.y, window.width, window.height, image.width, image.height]) {
     if (!Number.isFinite(n)) throw new Error('Native pointer geometry is not finite');
   }
   if (rect.width <= 0 || rect.height <= 0 || window.width <= 0 || window.height <= 0 || image.width <= 0 || image.height <= 0)
     throw new Error('Native pointer target has empty bounds');
-  const x = rect.x + rect.width / 2 - window.x;
+  if (!['center', 'trailing'].includes(anchor)) throw new Error('Unsupported native click anchor');
+  // Composite native controls may expose their label but not their trailing
+  // dropdown arrow. An explicit edge anchor stays within freshly verified AX
+  // bounds instead of guessing a screenshot coordinate or repeating AXShowMenu.
+  const x = rect.x + (anchor === 'trailing' ? rect.width - Math.min(8, rect.width / 4) : rect.width / 2) - window.x;
   const y = rect.y + rect.height / 2 - window.y;
   if (x < 0 || y < 0 || x >= window.width || y >= window.height)
     throw new Error('Native pointer target center is outside the requested window');
@@ -75,7 +80,7 @@ export function pixelCenter(rect: any, window: any, image: { width: number; heig
  * does not claim to coordinate external tools or detect human intervention.
  */
 export async function clickNativeBounds(pi: any, bin: string, call: any, target: any, element: any,
-  options: { count?: number; modifiers?: string[] }, signal?: AbortSignal, deadline: NativeDeadline | number = new NativeDeadline(15000)) {
+  options: { count?: number; modifiers?: string[]; anchor?: 'center' | 'trailing' }, signal?: AbortSignal, deadline: NativeDeadline | number = new NativeDeadline(15000)) {
   const budget = typeof deadline === "number" ? new NativeDeadline(deadline) : deadline;
   return nativeOperationCoordinator.runExclusive(
     targetOperationKeys(target, true), budget, signal, "native mouse grounding",
@@ -85,7 +90,10 @@ export async function clickNativeBounds(pi: any, bin: string, call: any, target:
       try {
         budget.assert("native mouse grounding", signal);
         const listed = await call('list_windows', { pid: target.pid, on_screen_only: true }, signal, budget.remaining("native mouse window lookup"));
-        const w = listed.data?.windows?.find((w: any) => w.window_id === target.windowId);
+        let catalog = listed.data?.windows ?? [];
+        if (!catalog.some((w: any) => w.window_id === target.windowId))
+          catalog = await supplementElevatedNativeWindows(pi, catalog, target.pid, signal, budget);
+        const w = catalog.find((w: any) => w.window_id === target.windowId);
         if (!w || w.on_current_space === false || !w.is_on_screen || !w.bounds)
           throw new Error('Native mouse fallback requires the exact visible window on the current Space');
         const query = { pid: target.pid, windowId: target.windowId, title: w.title, bounds: w.bounds, ...pointerIdentity(element) };
@@ -106,9 +114,12 @@ export async function clickNativeBounds(pi: any, bin: string, call: any, target:
         if (size < 24 || size > 8*1024*1024) throw new Error('Native mouse grounding image exceeds bounds');
         const bytes = readFileSync(path);
         if (!bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw new Error('Native mouse grounding image is not PNG');
-        const point = pixelCenter(rect, w.bounds, {width:bytes.readUInt32BE(16), height:bytes.readUInt32BE(20)});
+        const point = pixelCenter(rect, w.bounds, {width:bytes.readUInt32BE(16), height:bytes.readUInt32BE(20)}, options.anchor);
         const latest = await call('list_windows', {pid:target.pid, on_screen_only:true}, signal, budget.remaining("native mouse move check"));
-        const current = latest.data?.windows?.find((v: any) => v.window_id === target.windowId);
+        let currentCatalog = latest.data?.windows ?? [];
+        if (!currentCatalog.some((w: any) => w.window_id === target.windowId))
+          currentCatalog = await supplementElevatedNativeWindows(pi, currentCatalog, target.pid, signal, budget);
+        const current = currentCatalog.find((v: any) => v.window_id === target.windowId);
         // WindowServer can report a 1–2 point decoration correction immediately
         // after a native window is first realized. Larger movement is unsafe because
         // the fresh frame was grounded against the earlier bounds.

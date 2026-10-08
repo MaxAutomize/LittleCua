@@ -21,6 +21,21 @@ export type NativeDriverCapabilities = {
   };
 };
 
+/** A normal click must not invoke a text field's contextual menu. */
+export function nativeClickAction(role: string, line: string, supportsAction: boolean): 'press' | 'pick' | 'show_menu' {
+  if (/actions=\[[^\]]*\bAXPress\b/.test(line)) return 'press';
+  if (supportsAction && ['AXMenuItem','AXMenuBarItem'].includes(role) && /actions=\[[^\]]*\bAXPick\b/.test(line)) return 'pick';
+  if (supportsAction && ['AXMenuButton','AXPopUpButton'].includes(role) && /actions=\[[^\]]*\bAXShowMenu\b/.test(line)) return 'show_menu';
+  return 'press';
+}
+
+/** Inject only scope keys actually accepted by the discovered native schema. */
+export function nativeScopedPayload(capabilities: NativeDriverCapabilities, tool: string,
+  target: {pid:number;windowId:number}, payload: Record<string, unknown> = {}) {
+  return { ...(capabilities.supports(tool, 'pid') ? {pid:target.pid} : {}),
+    ...(capabilities.supports(tool, 'window_id') ? {window_id:target.windowId} : {}), ...payload };
+}
+
 const CACHE_TTL_MS = 10 * 60_000;
 let cached: NativeDriverCapabilities | undefined;
 let inFlight: Promise<NativeDriverCapabilities> | undefined;
