@@ -4,8 +4,11 @@
   "description": "LittleCua — Pi extensions that add native macOS automation (cua_driver) and live Chrome control (web_cli) to the Pi coding agent.",
   "keywords": ["pi-package"],
   "scripts": {
-    "test": "node extensions/cua-tool/tests/native-pointer.test.mjs && node extensions/cua-tool/tests/visual-results.test.mjs",
-    "test:live": "node extensions/cua-tool/tests/visual-live.mjs"
+    "test": "node extensions/cua-tool/tests/native-operation-coordinator.test.mjs && node extensions/cua-tool/tests/native-pointer.test.mjs && node extensions/cua-tool/tests/native-workflow-speed.test.mjs && node extensions/cua-tool/tests/visual-results.test.mjs",
+    "test:live": "node extensions/cua-tool/tests/visual-live.mjs",
+    "test:fixture": "node extensions/cua-tool/tests/native-fixture.e2e.mjs",
+    "test:business": "node extensions/cua-tool/tests/business-fixture.e2e.mjs",
+    "test:business-inform": "node extensions/cua-tool/tests/business-workflow-informed.mjs"
   },
   "license": "MIT",
   "author": "MaxAutomize",

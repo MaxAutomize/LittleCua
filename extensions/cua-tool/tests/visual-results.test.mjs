@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { jiti } from './pi-loader.mjs';
 const { withVisualResults } = await jiti.import('../visual-results.ts');
+const { nativeOperationCoordinator, scopedNativeDeadline, targetOperationKeys } = await jiti.import('../native-operation-coordinator.ts');
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 const vision = { model: { input: ['text', 'image'] } };
 let count = 0;
@@ -93,5 +94,25 @@ await test('repeated captures do not retain a sequence of files', async () => {
     assert.equal(r.content.filter(c=>c.type==='image').length, 1);
     assert.ok(r.details.captureRequestedAt); assert.ok(r.details.captureCompletedAt);
   }
+});
+await test('screenshotAfter keeps its exact-target lease through capture', async () => {
+  let activeCaptures=0, peakCaptures=0;
+  const base={async execute(_id,args,signal) {
+    const target={pid:123,windowId:456};
+    await nativeOperationCoordinator.holdForVisualCapture(targetOperationKeys(target),scopedNativeDeadline(),signal,'test visual reservation');
+    return {content:[{type:'text',text:'OK'}],details:{target}};
+  }};
+  const pi={async exec(_bin,args) {
+    activeCaptures++; peakCaptures=Math.max(peakCaptures,activeCaptures);
+    await new Promise(resolve=>setTimeout(resolve,20));
+    writeFileSync(args.at(-1),png); activeCaptures--;
+    return {code:0,stdout:'',stderr:''};
+  }};
+  const wrapped=withVisualResults(base,pi,'cua-driver');
+  const args={action:'workflow',screenshotAfter:true,returnImage:false,workflow};
+  const results=await Promise.all([wrapped.execute('one',args,undefined,undefined,vision),wrapped.execute('two',args,undefined,undefined,vision)]);
+  assert.equal(results.length,2); assert.equal(peakCaptures,1);
+  assert.equal(nativeOperationCoordinator.status().pending,0);
+  assert.deepEqual(nativeOperationCoordinator.status().activeKeys,[]);
 });
 console.log(`${count} tests passed`);

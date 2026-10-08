@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { NativeDeadline, nativeOperationCoordinator, targetOperationKeys, withNativeDeadline } from "./native-operation-coordinator.ts";
 
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const AFTER_ACTIONS = new Set(["inspect", "act", "sequence", "launch", "activate"]);
@@ -28,6 +29,9 @@ export function withVisualResults(tool: any, pi: any, bin: string) {
   return {
     ...tool,
     async execute(id: string, raw: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
+      const workflowTimeout = raw.workflow?.timeoutMs;
+      const deadline = new NativeDeadline(raw.timeoutMs ?? workflowTimeout ?? 20_000);
+      return nativeOperationCoordinator.withVisualCaptureScope(() => withNativeDeadline(deadline, async () => {
       const after = raw.screenshotAfter === true;
       if (after && (raw.action !== "workflow" || !AFTER_ACTIONS.has(raw.workflow?.action))) {
         throw new Error("screenshotAfter requires a single-target workflow: inspect, act, sequence, launch, or activate. For a program, use a program step inside sequence.");
@@ -49,7 +53,7 @@ export function withVisualResults(tool: any, pi: any, bin: string) {
       const started = performance.now();
       const captureRequestedAt = new Date().toISOString();
       try {
-        signal?.throwIfAborted();
+        deadline.assert("native visual capture", signal);
         // Resolve an explicitly named screenshot app instead of accidentally taking
         // a full-screen capture. Exact pid/window resolution stays in the executor.
         let params = { ...raw };
@@ -72,7 +76,7 @@ export function withVisualResults(tool: any, pi: any, bin: string) {
             signal?.throwIfAborted();
             if (!Number.isFinite(target?.windowId)) throw new Error("Workflow returned no exact target window.");
             const captureStart = performance.now();
-            const capture = await pi.exec(bin, ["call", "screenshot", JSON.stringify({ window_id: target.windowId, format: raw.format ?? "png", ...(raw.quality !== undefined ? { quality: raw.quality } : {}) }), "--compact", "--screenshot-out-file", path], { signal, timeout: raw.timeoutMs ?? raw.workflow.timeoutMs ?? 20_000 });
+            const capture = await nativeOperationCoordinator.runExclusive(targetOperationKeys(target), deadline, signal, "post-action screenshot", () => pi.exec(bin, ["call", "screenshot", JSON.stringify({ window_id: target.windowId, format: raw.format ?? "png", ...(raw.quality !== undefined ? { quality: raw.quality } : {}) }), "--compact", "--screenshot-out-file", path], { signal, timeout: deadline.remaining("post-action screenshot") }));
             if (capture.code !== 0) throw new Error((capture.stderr || capture.stdout || "Window capture failed").slice(0, 1000));
             result.details = { ...result.details, captureMs: performance.now() - captureStart };
           } catch (error) {
@@ -105,6 +109,7 @@ export function withVisualResults(tool: any, pi: any, bin: string) {
       } finally {
         if (dir) rmSync(dir, { recursive: true, force: true });
       }
+      }));
     },
   };
 }

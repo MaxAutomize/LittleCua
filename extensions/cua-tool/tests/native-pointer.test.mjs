@@ -16,4 +16,41 @@ try {
   assert.equal(mode,'mouse (AX bounds + fresh window frame)');
   assert.equal(calls.at(-1).tool,'click'); assert.equal(calls.at(-1).payload.x,3); assert.equal(calls.at(-1).payload.y,5.5);
 } finally { rmSync(dir,{recursive:true,force:true}); }
-console.log('PASS native pointer bounds and fresh-frame routing');
+
+async function rejectsMovedTarget() {
+  const calls=[]; let listCount=0;
+  const moved={...w,bounds:{...w.bounds,x:w.bounds.x+4}};
+  const call=async(tool,payload)=>{
+    calls.push({tool,payload});
+    if(tool==='list_windows') return {data:{windows:[listCount++ === 0 ? w : moved]}};
+    return {data:{}};
+  };
+  const pi={exec:async(_bin,args)=>{
+    if(args[0]==='-l') return {code:0,stdout:JSON.stringify({x:200,y:200,width:40,height:20}),stderr:''};
+    if(args.includes('--screenshot-out-file')) writeFileSync(args.at(-1),png);
+    return {code:0,stdout:'',stderr:''};
+  }};
+  await assert.rejects(clickNativeBounds(pi,'cua-driver',call,{pid:7,windowId:8},{role:'AXRow',line:'- AXRow (Sample) id=sample',label:'Sample'},{}),/moved/);
+  assert.equal(calls.some(c=>c.tool==='click'),false);
+}
+
+async function rejectsCancellationBeforeDispatch() {
+  const calls=[]; const controller=new AbortController();
+  const call=async(tool,payload)=>{
+    calls.push({tool,payload});
+    if(tool==='list_windows') return {data:{windows:[w]}};
+    if(tool==='get_window_state') { controller.abort('test cancellation'); return {data:{}}; }
+    return {data:{}};
+  };
+  const pi={exec:async(_bin,args)=>{
+    if(args[0]==='-l') return {code:0,stdout:JSON.stringify({x:200,y:200,width:40,height:20}),stderr:''};
+    if(args.includes('--screenshot-out-file')) writeFileSync(args.at(-1),png);
+    return {code:0,stdout:'',stderr:''};
+  }};
+  await assert.rejects(clickNativeBounds(pi,'cua-driver',call,{pid:7,windowId:8},{role:'AXRow',line:'- AXRow (Sample) id=sample',label:'Sample'}, {}, controller.signal),/cancelled/);
+  assert.equal(calls.some(c=>c.tool==='click'),false);
+}
+
+await rejectsMovedTarget();
+await rejectsCancellationBeforeDispatch();
+console.log('PASS native pointer bounds, moved-target, and cancellation routing');

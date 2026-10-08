@@ -155,7 +155,10 @@ Screenshots and zoom results are delivered as actual images to vision-capable mo
 - This is **on-demand screenshot capture, not continuous video recording**. macOS's Screen Recording permission also covers still screenshots.
 - Temporary capture files are always discarded; images remain in the Pi conversation. Explicit output paths are retained. Use `returnImage: false` with `screenshotOutFile`/`imageOut` for file-only delivery; implicit files are still discarded.
 - Missing/stale images are not attached. Post-action capture failure does not repeat completed actions.
-- Native clicks use AX to identify controls. `clickMode: "auto"` falls back to a fresh-frame mouse click for non-pressable controls; `mouse` forces that path and `ax` refuses fallback. Ambiguous or moving bounds fail closed.
+- Native clicks use AX to identify controls. `clickMode: "auto"` falls back to a fresh-frame mouse click for non-pressable controls; `mouse` forces that path and `ax` refuses fallback. Ambiguous, disabled, or materially moving bounds fail closed (a small WindowServer decoration correction is tolerated).
+- Native workflows use one end-to-end deadline and a bounded process-local coordinator: same-window work and pid-scoped mouse recipes cannot interleave, while safe independent exact-window reads remain parallel. No mutation is replayed after an ambiguous timeout/transport failure, and CuaDriver 0.1.4 exposes no OS-level human-intervention signal, so LittleCua does not claim one.
+- `fill` uses bounded mouse grounding followed by a fresh AX identity lookup and AX `set_value` for reliable replacement; focused `type_text` is still exercised separately for cleared-cell navigation.
+- Repeated native labels are safe by default: mutating selectors require `within` ancestor context or an explicit occurrence instead of silently selecting the first match.
 - `web_cli` click/click-text/type already target DOM controls directly; use trusted click/type only for custom inputs or gesture gates. Cua is not used for ordinary web DOM work.
 
 This reduces screenshot → read from **two tool calls to one**, and workflow → screenshot → read from **three to one**. Local direct screenshot calls measured about **0.15 seconds**; no end-to-end task speedup percentage has been established. See [workflow documentation](extensions/cua-tool/NATIVE_WORKFLOW.md) for details.
@@ -165,11 +168,13 @@ This reduces screenshot → read from **two tool calls to one**, and workflow �
 With Pi installed globally, run from the repository root:
 
 ```bash
-npm test            # regression tests; no desktop access (includes pointer routing)
+npm test            # portable regression tests; no desktop access
+npm run test:fixture # self-owned temporary AppKit spreadsheet/form fixture + detailed report
 npm run test:live   # read-only Calculator captures; macOS + open Calculator required
+npm run test:business-inform # developer-informed UI-only business workflow trials (not blind model evaluation)
 ```
 
-Tests reuse Pi's bundled loader/dependencies. For a non-global Pi installation, set `PI_PACKAGE_DIR` to its package directory. Live tests do not click or type.
+Tests reuse Pi's bundled loader/dependencies. For a non-global Pi installation, set `PI_PACKAGE_DIR` to its package directory. The fixture test owns a temporary AppKit process/windows, compares every expected cell/field through AX and an app-owned JSON oracle, restores the prior foreground app, and writes a detailed report under `~/Library/Application Support/LittleCua/reports/`. Live Calculator tests do not click or type. The fixture is not an Excel compatibility test.
 
 ### Environment variables
 
@@ -195,9 +200,14 @@ LittleCua/
     ├── cua-tool/
     │   ├── index.ts              # cua_driver tool
     │   ├── native-workflow-speed.ts # action: "workflow" implementation
+    │   ├── native-operation-coordinator.ts # bounded native deadline + local leases
+    │   ├── native-capabilities.ts # cached public installed-driver schema discovery
     │   ├── native-pointer.ts      # bounded AX-bounds mouse fallback
     │   ├── visual-results.ts      # inline images + optional post-batch capture
-    │   ├── tests/                 # regression + read-only live smoke tests
+    │   ├── tests/                 # regression, isolated fixtures, and read-only live smoke tests
+    │   ├── tests/business-fixture.swift # self-owned document-review workflow fixture
+    │   ├── tests/business-workflow-informed.mjs # UI-only semantic trial harness
+    │   ├── tests/business-grade.mjs # read-only objective oracle grader
     │   ├── sitegeist-runtime.ts  # shared Sitegeist handoff runtime
     │   └── NATIVE_WORKFLOW.md     # workflow docs
     └── web-cli/

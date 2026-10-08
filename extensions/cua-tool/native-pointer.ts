@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { NativeDeadline, nativeOperationCoordinator, targetOperationKeys } from "./native-operation-coordinator.ts";
 
 /** Driver 0.1.4 has no bounds-query or force-mouse-by-index API. Read AX geometry
  * through System Events, then use only the driver's documented pixel click.
@@ -67,45 +68,59 @@ export function pixelCenter(rect: any, window: any, image: { width: number; heig
   return { x: x * image.width / window.width, y: y * image.height / window.height };
 }
 
-/** Serialize pointer recipes, including their pid-scoped driver coordinate cache.
- * Other tools/processes do not participate in this module-local lock. */
-let pointerBusy = false;
+/**
+ * The public driver has pixel clicking but no bounds-by-index mouse API. Ground
+ * every fallback against one exact visible window and one fresh frame. The
+ * coordinator serializes only this process's same-window/pid mouse recipes; it
+ * does not claim to coordinate external tools or detect human intervention.
+ */
 export async function clickNativeBounds(pi: any, bin: string, call: any, target: any, element: any,
-  options: { count?: number; modifiers?: string[] }, signal?: AbortSignal, timeoutMs = 15000) {
-  if (pointerBusy) throw new Error('A native mouse recipe is already running; run mouse-dependent workflows sequentially.');
-  pointerBusy = true;
-  const dir = mkdtempSync(join(tmpdir(), 'pi-cua-pointer-'));
-  const path = join(dir, 'frame.png');
-  try {
-    signal?.throwIfAborted();
-    const listed = await call('list_windows', { pid: target.pid, on_screen_only: true }, signal, timeoutMs);
-    const w = listed.data?.windows?.find((w: any) => w.window_id === target.windowId);
-    if (!w || w.on_current_space === false || !w.is_on_screen || !w.bounds)
-      throw new Error('Native mouse fallback requires the exact visible window on the current Space');
-    const query = { pid: target.pid, windowId: target.windowId, title: w.title, bounds: w.bounds, ...pointerIdentity(element) };
-    const located = await pi.exec('/usr/bin/osascript', ['-l', 'JavaScript', '-e', BOUNDS_SCRIPT, JSON.stringify(query)], { signal, timeout: Math.min(timeoutMs, 8000) });
-    if (located.code !== 0) throw new Error(`Native bounds lookup failed: ${(located.stderr || located.stdout).slice(0, 1000)}`);
-    const rect = JSON.parse(located.stdout);
-    // Establish the driver's exact pid/window coordinate context. This replaces
-    // its element cache: the caller must invalidate its old observation afterward.
-    await call('get_window_state', { pid: target.pid, window_id: target.windowId }, signal, timeoutMs);
-    const capture = await pi.exec(bin, ['call', 'screenshot', JSON.stringify({window_id:target.windowId, format:'png'}), '--compact', '--screenshot-out-file', path], { signal, timeout: Math.min(timeoutMs, 20000) });
-    if (capture.code !== 0) throw new Error('Native mouse grounding capture failed');
-    const size = statSync(path).size;
-    if (size < 24 || size > 8*1024*1024) throw new Error('Native mouse grounding image exceeds bounds');
-    const bytes = readFileSync(path);
-    if (!bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw new Error('Native mouse grounding image is not PNG');
-    const point = pixelCenter(rect, w.bounds, {width:bytes.readUInt32BE(16), height:bytes.readUInt32BE(20)});
-    const latest = await call('list_windows', {pid:target.pid, on_screen_only:true}, signal, timeoutMs);
-    const current = latest.data?.windows?.find((v: any) => v.window_id === target.windowId);
-    if (!current?.is_on_screen || current.on_current_space === false ||
-        ['x','y','width','height'].some(k => current.bounds?.[k] !== w.bounds[k]))
-      throw new Error('Native window moved during mouse grounding; no click dispatched');
-    signal?.throwIfAborted();
-    await call('click', {pid:target.pid, window_id:target.windowId, ...point, count:options.count ?? 1, modifier:options.modifiers}, signal, timeoutMs);
-    return 'mouse (AX bounds + fresh window frame)';
-  } finally {
-    rmSync(dir, {recursive:true, force:true});
-    pointerBusy = false;
-  }
+  options: { count?: number; modifiers?: string[] }, signal?: AbortSignal, deadline: NativeDeadline | number = new NativeDeadline(15000)) {
+  const budget = typeof deadline === "number" ? new NativeDeadline(deadline) : deadline;
+  return nativeOperationCoordinator.runExclusive(
+    targetOperationKeys(target, true), budget, signal, "native mouse grounding",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'pi-cua-pointer-'));
+      const path = join(dir, 'frame.png');
+      try {
+        budget.assert("native mouse grounding", signal);
+        const listed = await call('list_windows', { pid: target.pid, on_screen_only: true }, signal, budget.remaining("native mouse window lookup"));
+        const w = listed.data?.windows?.find((w: any) => w.window_id === target.windowId);
+        if (!w || w.on_current_space === false || !w.is_on_screen || !w.bounds)
+          throw new Error('Native mouse fallback requires the exact visible window on the current Space');
+        const query = { pid: target.pid, windowId: target.windowId, title: w.title, bounds: w.bounds, ...pointerIdentity(element) };
+        const located = await pi.exec('/usr/bin/osascript', ['-l', 'JavaScript', '-e', BOUNDS_SCRIPT, JSON.stringify(query)], {
+          signal, timeout: budget.remaining("native bounds lookup", 8_000),
+        });
+        if (located.code !== 0) throw new Error(`Native bounds lookup failed: ${(located.stderr || located.stdout).slice(0, 1000)}`);
+        const rect = JSON.parse(located.stdout);
+        // Establish the driver's exact pid/window coordinate context. The caller
+        // discards its previous AX observation after this mouse route.
+        await call('get_window_state', { pid: target.pid, window_id: target.windowId }, signal, budget.remaining("native mouse AX grounding"));
+        budget.assert("native mouse grounding capture", signal);
+        const capture = await pi.exec(bin, ['call', 'screenshot', JSON.stringify({window_id:target.windowId, format:'png'}), '--compact', '--screenshot-out-file', path], {
+          signal, timeout: budget.remaining("native mouse grounding capture", 20_000),
+        });
+        if (capture.code !== 0) throw new Error('Native mouse grounding capture failed');
+        const size = statSync(path).size;
+        if (size < 24 || size > 8*1024*1024) throw new Error('Native mouse grounding image exceeds bounds');
+        const bytes = readFileSync(path);
+        if (!bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw new Error('Native mouse grounding image is not PNG');
+        const point = pixelCenter(rect, w.bounds, {width:bytes.readUInt32BE(16), height:bytes.readUInt32BE(20)});
+        const latest = await call('list_windows', {pid:target.pid, on_screen_only:true}, signal, budget.remaining("native mouse move check"));
+        const current = latest.data?.windows?.find((v: any) => v.window_id === target.windowId);
+        // WindowServer can report a 1–2 point decoration correction immediately
+        // after a native window is first realized. Larger movement is unsafe because
+        // the fresh frame was grounded against the earlier bounds.
+        const boundsDrift = ['x','y','width','height'].some(k => Math.abs(Number(current?.bounds?.[k]) - Number(w.bounds[k])) > 3);
+        if (!current?.is_on_screen || current.on_current_space === false || boundsDrift)
+          throw new Error(`Native window moved during mouse grounding; no click dispatched (before=${JSON.stringify(w.bounds)} after=${JSON.stringify(current?.bounds)})`);
+        budget.assert("native mouse dispatch", signal);
+        await call('click', {pid:target.pid, window_id:target.windowId, ...point, count:options.count ?? 1, modifier:options.modifiers}, signal, budget.remaining("native mouse dispatch"));
+        return 'mouse (AX bounds + fresh window frame)';
+      } finally {
+        rmSync(dir, {recursive:true, force:true});
+      }
+    },
+  );
 }
